@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jcr1440-client",
+    "crates/jcr1440-cluster",
+]

@@ -1,0 +1,17 @@
+[Unit]
+Description=JCR1440 Racing Instrument Cluster
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+# Point to the release binary — adjust path for your install location
+ExecStart=/opt/jcr1440/jcr1440-cluster --fullscreen --ip 192.168.1.1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,14 @@
+[package]
+name = "jcr1440-cluster"
+version = "0.1.0"
+edition = "2021"
+description = "Racing-style instrument cluster for JCR1440 OBD-II telemetry"
+
+[dependencies]
+jcr1440-client = { path = "../jcr1440-client" }
+eframe = { version = "0.31", features = ["glow", "default_fonts", "x11", "wayland"] }
+egui = "0.31"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }

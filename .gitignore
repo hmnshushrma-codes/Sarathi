@@ -1,0 +1,35 @@
+# === Sensitive data — never commit ===
+diagnostics/
+docs/jcr1440/private/
+/tmp/
+*.cookies
+*.cookie
+
+# Raw device captures
+*.pcap
+*.pcapng
+
+# === Build artifacts ===
+target/
+Cargo.lock
+
+# === IDE / OS ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# === Temp files ===
+/tmp/
+*.tmp
+*.log

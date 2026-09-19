@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Saarthi Cluster
+Comment=Vehicle instrument cluster with preflight diagnostics
+Exec=/opt/saarthi/bin/start-saarthi
+Terminal=false
+Type=Application
+Categories=Utility;System;
+StartupNotify=true
+Icon=utilities-system-monitor

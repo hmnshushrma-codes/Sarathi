@@ -1,24 +1,35 @@
-// Haltech-inspired racing instrument cluster for JCR1440 OBD-II telemetry.
+// NinoDash — Performance Digital Cluster.
 //
-// Rendering: eframe/egui with glow backend (OpenGL ES — Pi 4/5 compatible).
-// Architecture: tokio poller → watch channel → 60fps egui render with
-// exponential smoothing between ~300ms data updates.
+// Boot flow:
+//   1. Branded splash animation (~3s)
+//   2. Preflight screen validates system health
+//   3. User presses "Start Cluster"
+//   4. Selected cluster layout activates fullscreen
+//
+// Architecture: tokio poller → watch channel → 60fps egui render
+// One telemetry source, multiple cluster views.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
+use egui::Rect;
 use jcr1440_client::{DeviceConfig, DeviceState, ObdData, TelemetryFrame};
 use tokio::sync::watch;
 
+mod clusters;
 mod gauges;
+mod preflight;
+mod splash;
+mod switcher;
+mod theme;
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "jcr1440-cluster", about = "Racing instrument cluster")]
+#[command(name = "ninodash", about = "NinoDash — Performance Digital Cluster")]
 struct Cli {
     #[arg(long)]
     mock: bool,
@@ -32,6 +43,9 @@ struct Cli {
     width: u32,
     #[arg(long, default_value = "600")]
     height: u32,
+    /// Skip splash and preflight
+    #[arg(long)]
+    skip_preflight: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +110,28 @@ impl SmoothedGauges {
         else if ratio > 24.0 { 5 }
         else { 6 }
     }
+
+    fn to_layout(&self, frame: &Option<TelemetryFrame>, connected: bool, error_msg: &Option<String>) -> gauges::ClusterLayout {
+        gauges::ClusterLayout {
+            rpm: self.rpm,
+            speed: self.speed,
+            coolant_temp: self.coolant_temp,
+            intake_temp: self.intake_temp,
+            oil_temp: self.oil_temp,
+            voltage: self.voltage,
+            throttle: self.throttle,
+            manifold_pressure: self.manifold_pressure,
+            fuel_rate: self.fuel_rate,
+            fuel_level: self.fuel_level,
+            maf: self.maf,
+            gear: self.estimated_gear(),
+            gps: frame.as_ref().map(|f| f.gps.clone()),
+            dtc_count: frame.as_ref().and_then(|f| f.obd.dtc_count).unwrap_or(0),
+            connected,
+            error_msg: error_msg.clone(),
+            redline_intensity: 0.0,
+        }
+    }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -103,34 +139,89 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Screen state machine
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq)]
+enum Screen {
+    Splash,
+    Preflight,
+    Cluster,
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
-struct ClusterApp {
+struct NinoDashApp {
     rx: watch::Receiver<DeviceState>,
+    screen: Screen,
+    // Splash
+    splash: splash::SplashState,
+    // Preflight
+    preflight: preflight::PreflightState,
+    // Cluster
+    renderers: Vec<Box<dyn clusters::ClusterRenderer>>,
+    active_cluster: usize,
+    switcher: switcher::SwitcherState,
     gauges: SmoothedGauges,
     last_frame: Option<TelemetryFrame>,
     connected: bool,
     error_msg: Option<String>,
+    // Data loss recovery
+    data_lost_since: Option<Instant>,
+    data_restored_at: Option<Instant>,
 }
 
-impl ClusterApp {
-    fn new(rx: watch::Receiver<DeviceState>) -> Self {
-        Self { rx, gauges: SmoothedGauges::default(), last_frame: None, connected: false, error_msg: None }
+impl NinoDashApp {
+    fn new(rx: watch::Receiver<DeviceState>, skip_preflight: bool) -> Self {
+        let renderers = clusters::all_renderers();
+        let saved_id = clusters::load_selected_cluster();
+        let active_idx = renderers.iter()
+            .position(|r| r.id() == saved_id)
+            .unwrap_or(0);
+
+        let mut preflight = preflight::PreflightState::new();
+        preflight.start_checks();
+        preflight.selected_cluster_idx = active_idx;
+
+        let screen = if skip_preflight { Screen::Cluster } else { Screen::Splash };
+
+        Self {
+            rx,
+            screen,
+            splash: splash::SplashState::new(),
+            preflight,
+            renderers,
+            active_cluster: active_idx,
+            switcher: switcher::SwitcherState::new(active_idx),
+            gauges: SmoothedGauges::default(),
+            last_frame: None,
+            connected: false,
+            error_msg: None,
+            data_lost_since: None,
+            data_restored_at: None,
+        }
     }
-}
 
-impl eframe::App for ClusterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update_telemetry(&mut self) {
         let state = self.rx.borrow().clone();
         match state {
             DeviceState::Live(frame) => {
                 self.gauges.update(&frame.obd);
+                if !self.connected {
+                    self.data_restored_at = Some(Instant::now());
+                    self.data_lost_since = None;
+                }
                 self.last_frame = Some(frame);
                 self.connected = true;
                 self.error_msg = None;
             }
             DeviceState::Error { message, .. } => {
+                if self.connected && self.data_lost_since.is_none() {
+                    self.data_lost_since = Some(Instant::now());
+                    self.data_restored_at = None;
+                }
                 self.connected = false;
                 self.error_msg = Some(message);
                 self.gauges.update(&ObdData::default());
@@ -140,57 +231,151 @@ impl eframe::App for ClusterApp {
                 self.error_msg = Some("Connecting...".into());
             }
             DeviceState::Disconnected => {
+                if self.connected && self.data_lost_since.is_none() {
+                    self.data_lost_since = Some(Instant::now());
+                }
                 self.connected = false;
                 self.error_msg = Some("Disconnected".into());
             }
         }
+    }
 
-        // Background: pulse red near redline
-        let redline = 7000.0_f32;
-        let rpm = self.gauges.rpm;
-        let bg = if rpm > redline * 0.85 {
-            let intensity = ((rpm - redline * 0.85) / (redline * 0.15)).clamp(0.0, 1.0);
-            let flash = if rpm > redline {
-                (ctx.input(|i| i.time) as f32 * 12.0).sin().abs() * 0.4
-            } else { 0.0 };
-            let r = (8.0 + (70.0 + flash * 70.0) * intensity) as u8;
-            let g = (8.0 * (1.0 - intensity * 0.7)) as u8;
-            let b = (10.0 * (1.0 - intensity * 0.8)) as u8;
-            egui::Color32::from_rgb(r, g, b)
-        } else {
-            egui::Color32::from_rgb(8, 8, 10)
-        };
+    fn set_active_cluster(&mut self, idx: usize) {
+        if idx < self.renderers.len() {
+            self.active_cluster = idx;
+            self.switcher.selected_idx = idx;
+            clusters::save_selected_cluster(self.renderers[idx].id());
+        }
+    }
 
-        ctx.set_visuals(egui::Visuals::dark());
+    fn draw_cluster_screen(&mut self, ctx: &egui::Context) {
+        self.update_telemetry();
+
+        let layout = self.gauges.to_layout(
+            &self.last_frame, self.connected, &self.error_msg);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(bg))
+            .frame(egui::Frame::new().fill(theme::BG_BLACK))
             .show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 let painter = ui.painter_at(rect);
 
-                let layout = gauges::ClusterLayout {
-                    rpm: self.gauges.rpm,
-                    speed: self.gauges.speed,
-                    coolant_temp: self.gauges.coolant_temp,
-                    intake_temp: self.gauges.intake_temp,
-                    oil_temp: self.gauges.oil_temp,
-                    voltage: self.gauges.voltage,
-                    throttle: self.gauges.throttle,
-                    manifold_pressure: self.gauges.manifold_pressure,
-                    fuel_rate: self.gauges.fuel_rate,
-                    fuel_level: self.gauges.fuel_level,
-                    maf: self.gauges.maf,
-                    gear: self.gauges.estimated_gear(),
-                    gps: self.last_frame.as_ref().map(|f| f.gps.clone()),
-                    dtc_count: self.last_frame.as_ref().and_then(|f| f.obd.dtc_count).unwrap_or(0),
-                    connected: self.connected,
-                    error_msg: self.error_msg.clone(),
-                    redline_intensity: 0.0,
-                };
+                // Draw active cluster
+                if let Some(renderer) = self.renderers.get(self.active_cluster) {
+                    renderer.draw(&painter, rect, &layout);
+                }
 
-                gauges::draw_full_cluster(&painter, rect, &layout);
+                // Data restored flash
+                if let Some(restored) = self.data_restored_at {
+                    if restored.elapsed() < Duration::from_secs(3) {
+                        let banner_h = 36.0;
+                        let banner = Rect::from_min_size(rect.min,
+                            egui::Vec2::new(rect.width(), banner_h));
+                        painter.rect_filled(banner, 0.0,
+                            egui::Color32::from_rgba_premultiplied(255, 98, 0, 180));
+                        painter.text(banner.center(), egui::Align2::CENTER_CENTER,
+                            "VEHICLE DATA RESTORED",
+                            egui::FontId::proportional(14.0), theme::TEXT_PRIMARY);
+                    } else {
+                        self.data_restored_at = None;
+                    }
+                }
+
+                // Quick switch bar
+                if !self.switcher.overlay_open {
+                    let action = switcher::draw_quick_switch(
+                        ui, &painter, rect, &self.switcher, &self.renderers);
+                    match action {
+                        switcher::QuickSwitchAction::Prev => {
+                            let n = self.renderers.len();
+                            let idx = (self.active_cluster + n - 1) % n;
+                            self.set_active_cluster(idx);
+                            self.switcher.touch();
+                        }
+                        switcher::QuickSwitchAction::Next => {
+                            let idx = (self.active_cluster + 1) % self.renderers.len();
+                            self.set_active_cluster(idx);
+                            self.switcher.touch();
+                        }
+                        switcher::QuickSwitchAction::OpenOverlay => {
+                            self.switcher.overlay_open = true;
+                        }
+                        switcher::QuickSwitchAction::None => {}
+                    }
+                }
+
+                // Full selector overlay
+                if self.switcher.overlay_open {
+                    let action = switcher::draw_selector_overlay(
+                        ui, &painter, rect, self.active_cluster, &self.renderers);
+                    match action {
+                        switcher::SelectorAction::Select(idx) => {
+                            self.set_active_cluster(idx);
+                            self.switcher.overlay_open = false;
+                            self.switcher.touch();
+                        }
+                        switcher::SelectorAction::Close => {
+                            self.switcher.overlay_open = false;
+                        }
+                        switcher::SelectorAction::None => {}
+                    }
+                }
+
+                // Show quick switch on any pointer movement
+                if ui.input(|i| i.pointer.is_moving()) {
+                    self.switcher.touch();
+                }
+
+                // Ctrl+Alt+Q → back to preflight
+                if ui.input(|i| {
+                    i.key_pressed(egui::Key::Q) && i.modifiers.ctrl && i.modifiers.alt
+                }) {
+                    self.screen = Screen::Preflight;
+                    self.preflight = preflight::PreflightState::new();
+                    self.preflight.start_checks();
+                    self.preflight.selected_cluster_idx = self.active_cluster;
+                }
             });
+    }
+}
+
+impl eframe::App for NinoDashApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
+
+        match self.screen {
+            Screen::Splash => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::from_rgb(2, 2, 2)))
+                    .show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let painter = ui.painter_at(rect);
+                        if splash::draw_splash(ctx, &painter, rect, &mut self.splash) {
+                            self.screen = Screen::Preflight;
+                        }
+                    });
+            }
+            Screen::Preflight => {
+                self.preflight.update(&self.rx);
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme::BG_BLACK))
+                    .show(ctx, |ui| {
+                        let (start, cluster_idx) = preflight::draw_preflight(
+                            ui, &mut self.preflight, &self.renderers);
+                        if start {
+                            if let Some(idx) = cluster_idx {
+                                self.set_active_cluster(idx);
+                            }
+                            self.screen = Screen::Cluster;
+                            self.switcher.touch();
+                        }
+                    });
+            }
+            Screen::Cluster => {
+                self.draw_cluster_screen(ctx);
+            }
+        }
 
         ctx.request_repaint();
     }
@@ -216,6 +401,7 @@ fn main() {
     } else {
         let config = DeviceConfig {
             base_url: format!("http://{}", cli.ip),
+            interface: cli.iface.clone(),
             ..Default::default()
         };
         tracing::info!("Connecting to JCR1440 at {}", cli.ip);
@@ -231,9 +417,32 @@ fn main() {
     };
 
     eframe::run_native(
-        "JCR1440 Cluster",
+        "NinoDash",
         native_options,
-        Box::new(|_cc| Ok(Box::new(ClusterApp::new(rx)))),
+        Box::new(move |cc| {
+            // Load condensed italic font for racy feel
+            let font_paths = [
+                "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Italic.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-BoldItalic.ttf",
+            ];
+            let mut fonts = egui::FontDefinitions::default();
+            for path in &font_paths {
+                if let Ok(data) = std::fs::read(path) {
+                    let name = if path.contains("Bold") { "bold-italic" } else { "italic" };
+                    fonts.font_data.insert(
+                        name.to_string(),
+                        std::sync::Arc::new(egui::FontData::from_owned(data)),
+                    );
+                    // Put italic first in the proportional family so it becomes default
+                    fonts.families.entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, name.to_string());
+                }
+            }
+            cc.egui_ctx.set_fonts(fonts);
+
+            Ok(Box::new(NinoDashApp::new(rx, cli.skip_preflight)))
+        }),
     )
     .expect("eframe run");
 }

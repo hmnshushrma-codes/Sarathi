@@ -1,0 +1,59 @@
+#!/bin/bash
+# jcr1440-status — Print current JCR1440 device status
+set -euo pipefail
+
+STATE_FILE="/run/jcr1440-monitor.state"
+PID_FILE="/run/jcr1440-monitor.pid"
+
+echo "JCR1440 Status"
+echo "--------------"
+
+# Check if monitor is running
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "Monitor service: RUNNING (PID $(cat "$PID_FILE"))"
+else
+    echo "Monitor service: NOT RUNNING"
+fi
+
+# Read state file
+if [ ! -f "$STATE_FILE" ]; then
+    echo "No state file found. Is the monitor service running?"
+    echo ""
+    echo "Quick check:"
+    if lsusb 2>/dev/null | grep -qi "05c6:f00e"; then
+        echo "  Device detected: YES (via lsusb)"
+    else
+        echo "  Device detected: NO"
+    fi
+    exit 0
+fi
+
+# Parse JSON state
+if command -v python3 &>/dev/null; then
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('$STATE_FILE'))
+    print(f\"Device detected: {'YES' if d.get('usb_detected') else 'NO'}\")
+    vid_pid = '05c6:f00e'
+    print(f'USB ID: {vid_pid}')
+    sp = d.get('serial_interfaces', [])
+    print(f\"Serial ports: {' '.join(sp) if sp else 'none'}\")
+    ni = d.get('network_interfaces', [])
+    print(f\"Network: {' '.join(ni) if ni else 'none'}\")
+    print(f\"RX activity: {'YES' if d.get('network_rx_activity') or d.get('serial_rx_activity') else 'NO'}\")
+    print(f\"TX activity: {'YES' if d.get('network_tx_activity') else 'NO'}\")
+    ts = d.get('timestamp', 'unknown')
+    print(f'Last update: {ts}')
+    sd = d.get('session_dir', 'unknown')
+    print(f'Current session: {sd}')
+    print()
+    print(f\"Overall: {d.get('overall', 'UNKNOWN')}\")
+except Exception as e:
+    print(f'Error reading state: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+else
+    echo "python3 not available, dumping raw state:"
+    cat "$STATE_FILE"
+fi

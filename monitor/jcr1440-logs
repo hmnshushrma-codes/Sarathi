@@ -1,0 +1,24 @@
+#!/bin/bash
+# jcr1440-logs — Print the path to the latest log session
+set -euo pipefail
+
+LOG_ROOT="/var/log/jcr1440"
+
+if [ ! -d "$LOG_ROOT" ]; then
+    echo "No log directory found at $LOG_ROOT"
+    exit 1
+fi
+
+LATEST=$(ls -1d "$LOG_ROOT"/*/ 2>/dev/null | sort | tail -1)
+
+if [ -z "$LATEST" ]; then
+    echo "No log sessions found in $LOG_ROOT"
+    exit 1
+fi
+
+echo "Latest session: $LATEST"
+echo ""
+echo "Contents:"
+ls -lh "$LATEST"
+echo ""
+echo "Total size: $(du -sh "$LATEST" | cut -f1)"

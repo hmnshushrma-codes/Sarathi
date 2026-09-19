@@ -1,0 +1,20 @@
+[Unit]
+Description=Saarthi Vehicle Cluster UI (auto-start)
+After=graphical.target jcr1440-telemetry.service
+Wants=jcr1440-telemetry.service
+
+[Service]
+Type=simple
+User=shambhu
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+ExecStart=/opt/saarthi/bin/start-saarthi
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical.target

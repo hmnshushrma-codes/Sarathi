@@ -1,0 +1,24 @@
+#!/bin/bash
+# jcr1440-tail — Tail the current session's summary log
+set -euo pipefail
+
+LOG_ROOT="/var/log/jcr1440"
+
+LATEST=$(ls -1d "$LOG_ROOT"/*/ 2>/dev/null | sort | tail -1)
+
+if [ -z "$LATEST" ]; then
+    echo "No log sessions found in $LOG_ROOT"
+    exit 1
+fi
+
+SUMMARY="$LATEST/summary.log"
+
+if [ ! -f "$SUMMARY" ]; then
+    echo "No summary.log in $LATEST"
+    exit 1
+fi
+
+echo "Tailing: $SUMMARY"
+echo "Press Ctrl+C to stop"
+echo "---"
+tail -f "$SUMMARY"

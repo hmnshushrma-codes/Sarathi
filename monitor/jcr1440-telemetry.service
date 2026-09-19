@@ -1,0 +1,26 @@
+[Unit]
+Description=JCR1440 Telemetry & Diagnostic Monitor
+After=local-fs.target usb.mount systemd-udev-settle.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/jcr1440-monitor/monitor.py
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jcr1440-monitor
+
+# Security — read-only observation only
+ProtectSystem=strict
+ReadWritePaths=/var/log/jcr1440 /run
+ProtectHome=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

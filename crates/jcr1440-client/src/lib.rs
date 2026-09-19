@@ -87,7 +87,13 @@ impl Default for DeviceConfig {
 /// Resolve a network interface name (e.g. "enxfcde56ff0106") to its IPv4 address
 /// by parsing the output of `ip -4 -o addr show <iface>`.
 fn resolve_interface_addr(iface: &str) -> Option<IpAddr> {
-    let output = std::process::Command::new("ip")
+    // Try /usr/sbin/ip first (Ubuntu/Debian), fall back to bare "ip"
+    let ip_bin = if std::path::Path::new("/usr/sbin/ip").exists() {
+        "/usr/sbin/ip"
+    } else {
+        "ip"
+    };
+    let output = std::process::Command::new(ip_bin)
         .args(["-4", "-o", "addr", "show", iface])
         .output()
         .ok()?;

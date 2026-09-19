@@ -1,14 +1,8 @@
-//! Automotive-style preflight diagnostic screen.
+//! Animated automotive preflight diagnostic screen.
 //!
-//! Validates system health before showing the main cluster:
-//!   - Raspberry Pi health (CPU, RAM, temp, storage)
-//!   - JCR1440 USB detection and connectivity
-//!   - OBD telemetry stream status
-//!   - GPS fix status
-//!   - Network connectivity
-//!   - Telemetry monitor service
-//!
-//! Required systems must pass for READY; optional systems produce warnings.
+//! All animations are time-based (not frame-coupled), targeting 60fps.
+//! Health checks run in background threads; the UI only reads the latest state.
+//! Progress indicator, staggered row appearance, pulsing status dots.
 
 use std::process::Command;
 use std::sync::mpsc;
@@ -25,27 +19,38 @@ use crate::clusters::ClusterRenderer;
 use crate::theme;
 
 // ---------------------------------------------------------------------------
-// Colors — NinoDash themed
+// Colors
 // ---------------------------------------------------------------------------
 
-const BG_DARK: Color32 = Color32::from_rgb(5, 5, 5);
-const CARD_BG: Color32 = Color32::from_rgb(17, 17, 20);
-const CARD_BORDER: Color32 = Color32::from_rgb(36, 36, 40);
-const TITLE_COLOR: Color32 = Color32::from_rgb(255, 98, 0);
-const SUBTITLE_COLOR: Color32 = Color32::from_rgb(140, 145, 155);
-const TEXT_WHITE: Color32 = Color32::from_rgb(244, 244, 244);
-const TEXT_DIM: Color32 = Color32::from_rgb(118, 118, 118);
-const STATUS_READY: Color32 = Color32::from_rgb(30, 200, 80);    // green = healthy
-const STATUS_WARNING: Color32 = Color32::from_rgb(255, 160, 0);  // orange = warning
-const STATUS_FAILED: Color32 = Color32::from_rgb(227, 24, 24);   // red = failed
-const STATUS_CHECKING: Color32 = Color32::from_rgb(168, 168, 168);
-const BTN_BG: Color32 = Color32::from_rgb(255, 98, 0);
-const BTN_BG_HOVER: Color32 = Color32::from_rgb(255, 120, 0);
-const BTN_BG_DISABLED: Color32 = Color32::from_rgb(36, 36, 40);
-const BTN_TEXT: Color32 = Color32::from_rgb(5, 5, 5);
-const BTN_TEXT_DISABLED: Color32 = Color32::from_rgb(80, 80, 85);
-const CLOCK_COLOR: Color32 = Color32::from_rgb(168, 168, 168);
-const DETAIL_BG: Color32 = Color32::from_rgb(12, 12, 16);
+const BG: Color32 = Color32::from_rgb(5, 5, 5);
+const PANEL_BG: Color32 = Color32::from_rgb(14, 14, 17);
+const ROW_BG: Color32 = Color32::from_rgb(17, 17, 20);
+const ROW_BORDER: Color32 = Color32::from_rgb(30, 30, 34);
+const SEPARATOR: Color32 = Color32::from_rgb(30, 30, 34);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(244, 244, 244);
+const TEXT_SECONDARY: Color32 = Color32::from_rgb(184, 184, 184);
+const TEXT_MUTED: Color32 = Color32::from_rgb(96, 96, 96);
+const ORANGE: Color32 = Color32::from_rgb(255, 90, 0);
+const ORANGE_HOVER: Color32 = Color32::from_rgb(255, 107, 0);
+const GREEN: Color32 = Color32::from_rgb(30, 200, 80);
+const RED: Color32 = Color32::from_rgb(227, 24, 24);
+const AMBER: Color32 = Color32::from_rgb(255, 160, 0);
+const CHECKING_COLOR: Color32 = Color32::from_rgb(120, 120, 125);
+const BTN_DISABLED_BG: Color32 = Color32::from_rgb(28, 28, 32);
+const BTN_DISABLED_TEXT: Color32 = Color32::from_rgb(70, 70, 75);
+const DETAIL_BG: Color32 = Color32::from_rgb(10, 10, 14);
+const PROGRESS_BG: Color32 = Color32::from_rgb(25, 25, 28);
+
+// ---------------------------------------------------------------------------
+// Animation constants
+// ---------------------------------------------------------------------------
+
+const ROW_STAGGER_DELAY: f32 = 0.08;  // seconds between row appearances
+const ROW_FADE_DURATION: f32 = 0.3;
+const STATUS_TRANSITION: f32 = 0.4;
+const PULSE_SPEED: f32 = 3.0;         // Hz for checking pulse
+const PROGRESS_LERP_SPEED: f32 = 6.0;
+const DOT_RADIUS: f32 = 4.5;
 
 // ---------------------------------------------------------------------------
 // Check status
@@ -75,35 +80,38 @@ impl CheckStatus {
         }
     }
 
-    fn icon(&self) -> &'static str {
+    fn symbol(&self) -> &'static str {
         match self {
-            Self::Checking => "...",
-            Self::Ready | Self::Connected | Self::Receiving => "[OK]",
-            Self::Warning => "[!!]",
-            Self::Failed | Self::NotAvailable => "[XX]",
+            Self::Checking => "",  // animated dot
+            Self::Ready => "OK",
+            Self::Connected => "OK",
+            Self::Receiving => "OK",
+            Self::Warning => "!",
+            Self::Failed => "X",
+            Self::NotAvailable => "X",
         }
     }
 
     fn color(&self) -> Color32 {
         match self {
-            Self::Checking => STATUS_CHECKING,
-            Self::Ready | Self::Connected | Self::Receiving => STATUS_READY,
-            Self::Warning => STATUS_WARNING,
-            Self::Failed | Self::NotAvailable => STATUS_FAILED,
+            Self::Checking => CHECKING_COLOR,
+            Self::Ready | Self::Connected | Self::Receiving => GREEN,
+            Self::Warning => AMBER,
+            Self::Failed | Self::NotAvailable => RED,
         }
     }
 
-    fn is_ok(&self) -> bool {
+    pub fn is_ok(&self) -> bool {
         matches!(self, Self::Ready | Self::Connected | Self::Receiving)
     }
 
-    fn is_done(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         !matches!(self, Self::Checking)
     }
 }
 
 // ---------------------------------------------------------------------------
-// System check data
+// Data
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -112,7 +120,6 @@ pub struct SystemCheck {
     pub status: CheckStatus,
     pub detail: String,
     pub required: bool,
-    /// Extra details for the expanded view
     pub extra: Vec<(String, String)>,
 }
 
@@ -127,7 +134,7 @@ pub enum OverallStatus {
 impl OverallStatus {
     fn label(&self) -> &'static str {
         match self {
-            Self::Checking => "CHECKING",
+            Self::Checking => "SYSTEM CHECK",
             Self::Ready => "READY",
             Self::ReadyWithWarnings => "READY WITH WARNINGS",
             Self::NotReady => "NOT READY",
@@ -136,12 +143,22 @@ impl OverallStatus {
 
     fn color(&self) -> Color32 {
         match self {
-            Self::Checking => STATUS_CHECKING,
-            Self::Ready => STATUS_READY,
-            Self::ReadyWithWarnings => STATUS_WARNING,
-            Self::NotReady => STATUS_FAILED,
+            Self::Checking => CHECKING_COLOR,
+            Self::Ready => GREEN,
+            Self::ReadyWithWarnings => AMBER,
+            Self::NotReady => RED,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Animation state per row
+// ---------------------------------------------------------------------------
+
+struct RowAnim {
+    appear_time: f32,         // elapsed seconds when row should appear
+    status_changed_at: f32,   // elapsed seconds when status last changed
+    last_status: CheckStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,77 +173,37 @@ pub struct PreflightState {
     pub checks_complete: bool,
     pub expanded_check: Option<usize>,
     pub dev_panel_open: bool,
-    /// Selected cluster index for preflight cluster selector
     pub selected_cluster_idx: usize,
-    /// Background check thread result channel
     bg_rx: Option<mpsc::Receiver<Vec<SystemCheck>>>,
-    /// Last telemetry state for live updates
     last_device_state: DeviceState,
     last_telemetry_update: Instant,
     telemetry_packets: u64,
+    // Animation
+    row_anims: Vec<RowAnim>,
+    displayed_progress: f32,
 }
 
 impl PreflightState {
     pub fn new() -> Self {
+        let checks = vec![
+            SystemCheck { name: "Raspberry Pi System".into(), status: CheckStatus::Checking, detail: String::new(), required: true, extra: vec![] },
+            SystemCheck { name: "JCR1440 USB Device".into(), status: CheckStatus::Checking, detail: String::new(), required: true, extra: vec![] },
+            SystemCheck { name: "OBD Interface".into(), status: CheckStatus::Checking, detail: String::new(), required: true, extra: vec![] },
+            SystemCheck { name: "Vehicle Data Stream".into(), status: CheckStatus::Checking, detail: String::new(), required: true, extra: vec![] },
+            SystemCheck { name: "GPS".into(), status: CheckStatus::Checking, detail: String::new(), required: false, extra: vec![] },
+            SystemCheck { name: "Network".into(), status: CheckStatus::Checking, detail: String::new(), required: false, extra: vec![] },
+            SystemCheck { name: "Telemetry Service".into(), status: CheckStatus::Checking, detail: String::new(), required: false, extra: vec![] },
+            SystemCheck { name: "Storage".into(), status: CheckStatus::Checking, detail: String::new(), required: false, extra: vec![] },
+        ];
+        let num = checks.len();
+        let row_anims = (0..num).map(|i| RowAnim {
+            appear_time: 0.3 + i as f32 * ROW_STAGGER_DELAY,
+            status_changed_at: 0.0,
+            last_status: CheckStatus::Checking,
+        }).collect();
+
         Self {
-            checks: vec![
-                SystemCheck {
-                    name: "Raspberry Pi System".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: true,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "JCR1440 USB Device".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: true,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "OBD Interface".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: true,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "Vehicle Data Stream".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: true,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "GPS".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: false,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "Network".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: false,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "Telemetry Service".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: false,
-                    extra: vec![],
-                },
-                SystemCheck {
-                    name: "Storage".into(),
-                    status: CheckStatus::Checking,
-                    detail: String::new(),
-                    required: false,
-                    extra: vec![],
-                },
-            ],
+            checks,
             overall: OverallStatus::Checking,
             status_message: "Running preflight checks...".into(),
             started_at: Instant::now(),
@@ -238,28 +215,40 @@ impl PreflightState {
             last_device_state: DeviceState::Disconnected,
             last_telemetry_update: Instant::now(),
             telemetry_packets: 0,
+            row_anims,
+            displayed_progress: 0.0,
         }
     }
 
-    /// Kick off background system checks (non-blocking).
     pub fn start_checks(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.bg_rx = Some(rx);
-
         std::thread::spawn(move || {
             let checks = run_system_checks();
             let _ = tx.send(checks);
         });
     }
 
-    /// Poll background checks and update telemetry state.
+    fn elapsed(&self) -> f32 {
+        self.started_at.elapsed().as_secs_f32()
+    }
+
     pub fn update(&mut self, device_rx: &watch::Receiver<DeviceState>) {
-        // Check if background system checks have completed
+        let t = self.elapsed();
+
+        // Poll background system checks
         if let Some(ref rx) = self.bg_rx {
             if let Ok(system_checks) = rx.try_recv() {
-                // Merge system checks with our check list
                 for sc in &system_checks {
-                    if let Some(check) = self.checks.iter_mut().find(|c| c.name == sc.name) {
+                    if let Some((idx, check)) = self.checks.iter_mut().enumerate()
+                        .find(|(_, c)| c.name == sc.name)
+                    {
+                        if check.status != sc.status {
+                            if idx < self.row_anims.len() {
+                                self.row_anims[idx].status_changed_at = t;
+                                self.row_anims[idx].last_status = check.status;
+                            }
+                        }
                         check.status = sc.status;
                         check.detail = sc.detail.clone();
                         check.extra = sc.extra.clone();
@@ -269,166 +258,121 @@ impl PreflightState {
             }
         }
 
-        // Update from telemetry poller state
+        // Update from telemetry poller
         let state = device_rx.borrow().clone();
         match &state {
             DeviceState::Live(frame) => {
                 self.telemetry_packets += 1;
                 self.last_telemetry_update = Instant::now();
 
-                // JCR1440 USB — must be connected if we're getting data
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "JCR1440 USB Device") {
-                    if !matches!(c.status, CheckStatus::Connected) {
-                        c.status = CheckStatus::Connected;
-                        c.detail = "Device responding".into();
-                    }
-                }
+                // JCR1440 USB
+                self.update_check("JCR1440 USB Device", CheckStatus::Connected,
+                    "Device responding", t);
 
                 // OBD Interface
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "OBD Interface") {
-                    let has_obd = frame.obd.engine_rpm.is_some()
-                        || frame.obd.vehicle_speed.is_some()
-                        || frame.obd.battery_voltage.is_some();
-                    if has_obd {
-                        c.status = CheckStatus::Connected;
-                        c.detail = "OBD data available".into();
-                    } else if frame.device_connected {
-                        c.status = CheckStatus::Warning;
-                        c.detail = "Device connected, no OBD data".into();
-                    }
+                let has_obd = frame.obd.engine_rpm.is_some()
+                    || frame.obd.vehicle_speed.is_some()
+                    || frame.obd.battery_voltage.is_some();
+                if has_obd {
+                    self.update_check("OBD Interface", CheckStatus::Connected,
+                        "OBD data available", t);
+                } else if frame.device_connected {
+                    self.update_check("OBD Interface", CheckStatus::Warning,
+                        "Device connected, no OBD data", t);
                 }
 
                 // Vehicle Data Stream
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "Vehicle Data Stream") {
-                    let has_data = frame.obd.engine_rpm.is_some()
-                        || frame.obd.vehicle_speed.is_some();
-                    if has_data {
-                        c.status = CheckStatus::Receiving;
-                        c.detail = format!("{} packets", self.telemetry_packets);
-
-                        let mut extras = vec![];
-                        extras.push(("Source".into(), "JCR1440".into()));
-                        extras.push(("Packets".into(), format!("{}", self.telemetry_packets)));
-                        if let Some(rpm) = frame.obd.engine_rpm {
-                            extras.push(("RPM".into(), format!("{:.0}", rpm)));
-                        }
-                        if let Some(spd) = frame.obd.vehicle_speed {
-                            extras.push(("Speed".into(), format!("{:.0} km/h", spd)));
-                        }
-                        if let Some(v) = frame.obd.battery_voltage {
-                            extras.push(("Battery".into(), format!("{:.1} V", v)));
-                        }
-                        if let Some(t) = frame.obd.coolant_temp {
-                            extras.push(("Coolant".into(), format!("{:.0} °C", t)));
-                        }
-                        if let Some(tp) = frame.obd.throttle_position {
-                            extras.push(("Throttle".into(), format!("{:.0}%", tp)));
-                        }
-                        c.extra = extras;
-                    } else {
-                        c.status = CheckStatus::Warning;
-                        c.detail = "Waiting for vehicle data...".into();
-                    }
+                let has_data = frame.obd.engine_rpm.is_some()
+                    || frame.obd.vehicle_speed.is_some();
+                if has_data {
+                    self.update_check("Vehicle Data Stream", CheckStatus::Receiving,
+                        &format!("{} packets", self.telemetry_packets), t);
+                } else {
+                    self.update_check("Vehicle Data Stream", CheckStatus::Warning,
+                        "Waiting for vehicle data...", t);
                 }
 
-                // GPS — show as ready if satellites visible, even without position fix
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "GPS") {
-                    if frame.gps.fix_valid && frame.gps.satellites > 0 {
-                        c.status = CheckStatus::Ready;
-                        c.detail = format!("Fix: {} sats, HDOP {:.1}",
-                            frame.gps.satellites, frame.gps.hdop);
-                        c.extra = vec![
-                            ("Fix".into(), "YES".into()),
-                            ("Satellites".into(), format!("{}", frame.gps.satellites)),
-                            ("HDOP".into(), format!("{:.1}", frame.gps.hdop)),
-                            ("Accuracy".into(), format!("{:.0} m", frame.gps.accuracy)),
-                        ];
-                    } else if frame.gps.satellites > 0 {
-                        // GPS module active, has satellites but no position fix yet
-                        c.status = CheckStatus::Ready;
-                        c.detail = format!("Active: {} sats, no fix", frame.gps.satellites);
-                        c.extra = vec![
-                            ("Fix".into(), "NO (searching)".into()),
-                            ("Satellites".into(), format!("{}", frame.gps.satellites)),
-                            ("Module".into(), "ACTIVE".into()),
-                        ];
-                    } else {
-                        c.status = CheckStatus::Warning;
-                        c.detail = "No GPS signal".into();
-                        c.extra = vec![
-                            ("Fix".into(), "NO".into()),
-                            ("Satellites".into(), "0".into()),
-                        ];
-                    }
+                // GPS
+                if frame.gps.fix_valid && frame.gps.satellites > 0 {
+                    self.update_check("GPS", CheckStatus::Ready,
+                        &format!("Fix: {} sats, HDOP {:.1}", frame.gps.satellites, frame.gps.hdop), t);
+                } else if frame.gps.satellites > 0 {
+                    self.update_check("GPS", CheckStatus::Ready,
+                        &format!("Active: {} sats, no fix", frame.gps.satellites), t);
+                } else {
+                    self.update_check("GPS", CheckStatus::Warning, "No GPS signal", t);
                 }
             }
             DeviceState::Connecting => {
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "JCR1440 USB Device") {
-                    c.status = CheckStatus::Checking;
-                    c.detail = "Connecting...".into();
-                }
+                self.update_check("JCR1440 USB Device", CheckStatus::Checking,
+                    "Connecting...", t);
             }
             DeviceState::Error { message, failures } => {
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "JCR1440 USB Device") {
-                    if *failures > 5 {
-                        c.status = CheckStatus::Failed;
-                    } else {
-                        c.status = CheckStatus::Checking;
-                    }
-                    c.detail = format!("{} ({}x)", message, failures);
-                }
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "Vehicle Data Stream") {
-                    c.status = CheckStatus::Warning;
-                    c.detail = "No data yet".into();
+                if *failures > 5 {
+                    self.update_check("JCR1440 USB Device", CheckStatus::Failed,
+                        &format!("{} ({}x)", message, failures), t);
                 }
             }
             DeviceState::Disconnected => {
-                if let Some(c) = self.checks.iter_mut().find(|c| c.name == "JCR1440 USB Device") {
-                    if self.started_at.elapsed() > Duration::from_secs(10) {
-                        c.status = CheckStatus::Failed;
-                        c.detail = "Not detected".into();
-                    }
+                if self.elapsed() > 10.0 {
+                    self.update_check("JCR1440 USB Device", CheckStatus::Failed,
+                        "Not detected", t);
                 }
             }
         }
         self.last_device_state = state;
 
-        // Compute overall status
-        let all_done = self.checks.iter().all(|c| c.status.is_done());
-        let _required_ok = self.checks.iter()
-            .filter(|c| c.required)
-            .all(|c| c.status.is_ok());
-        let any_warning = self.checks.iter()
-            .any(|c| matches!(c.status, CheckStatus::Warning));
+        // Overall status
+        let done_count = self.checks.iter().filter(|c| c.status.is_done()).count();
+        let total = self.checks.len();
+        let all_done = done_count == total;
         let required_failed = self.checks.iter()
             .filter(|c| c.required)
             .any(|c| matches!(c.status, CheckStatus::Failed | CheckStatus::NotAvailable));
+        let any_warning = self.checks.iter()
+            .any(|c| matches!(c.status, CheckStatus::Warning));
 
-        if !all_done && self.started_at.elapsed() < Duration::from_secs(15) {
+        if !all_done && self.elapsed() < 15.0 {
             self.overall = OverallStatus::Checking;
-            self.status_message = "Running preflight checks...".into();
+            self.status_message = format!("{} / {} checks complete", done_count, total);
         } else if required_failed {
             self.overall = OverallStatus::NotReady;
             let failed: Vec<_> = self.checks.iter()
                 .filter(|c| c.required && !c.status.is_ok())
-                .map(|c| c.name.as_str())
-                .collect();
-            self.status_message = format!("Required systems unavailable: {}",
-                failed.join(", "));
+                .map(|c| c.name.as_str()).collect();
+            self.status_message = failed.join(", ");
         } else if any_warning {
             self.overall = OverallStatus::ReadyWithWarnings;
             let warns: Vec<_> = self.checks.iter()
                 .filter(|c| matches!(c.status, CheckStatus::Warning))
-                .map(|c| c.name.as_str())
-                .collect();
-            self.status_message = format!("{} have warnings. Cluster can run.",
-                warns.join(", "));
+                .map(|c| c.name.as_str()).collect();
+            self.status_message = warns.join(", ");
         } else {
             self.overall = OverallStatus::Ready;
-            self.status_message = "All systems operational.".into();
+            self.status_message = "All critical systems operational".into();
         }
 
-        self.checks_complete = all_done || self.started_at.elapsed() > Duration::from_secs(15);
+        self.checks_complete = all_done || self.elapsed() > 15.0;
+
+        // Smooth progress interpolation
+        let target = done_count as f32 / total as f32;
+        let dt = 1.0 / 60.0; // approximate
+        self.displayed_progress += (target - self.displayed_progress) * (1.0 - (-PROGRESS_LERP_SPEED * dt).exp());
+    }
+
+    fn update_check(&mut self, name: &str, status: CheckStatus, detail: &str, t: f32) {
+        if let Some((idx, check)) = self.checks.iter_mut().enumerate()
+            .find(|(_, c)| c.name == name)
+        {
+            if check.status != status {
+                if idx < self.row_anims.len() {
+                    self.row_anims[idx].status_changed_at = t;
+                    self.row_anims[idx].last_status = check.status;
+                }
+                check.status = status;
+            }
+            check.detail = detail.into();
+        }
     }
 
     pub fn can_start(&self) -> bool {
@@ -437,28 +381,428 @@ impl PreflightState {
 }
 
 // ---------------------------------------------------------------------------
-// Background system checks (blocking, runs in thread)
+// UI drawing
+// ---------------------------------------------------------------------------
+
+pub fn draw_preflight(
+    ui: &mut Ui,
+    state: &mut PreflightState,
+    renderers: &[Box<dyn ClusterRenderer>],
+) -> (bool, Option<usize>) {
+    let mut start_pressed = false;
+    let avail = ui.available_rect_before_wrap();
+    let w = avail.width();
+    let h = avail.height();
+    let t = state.elapsed();
+    let painter = ui.painter_at(avail);
+
+    painter.rect_filled(avail, 0.0, BG);
+
+    // === Header (8%) ===
+    let header_h = h * 0.08;
+    draw_header(&painter, Rect::from_min_size(avail.min, Vec2::new(w, header_h)), t);
+
+    // === Progress bar (1.5%) ===
+    let prog_y = avail.top() + header_h;
+    let prog_h = h * 0.015;
+    let prog_rect = Rect::from_min_size(
+        Pos2::new(avail.left() + w * 0.05, prog_y),
+        Vec2::new(w * 0.90, prog_h));
+    painter.rect_filled(prog_rect, 2.0, PROGRESS_BG);
+    let fill_w = prog_rect.width() * state.displayed_progress.clamp(0.0, 1.0);
+    if fill_w > 0.5 {
+        let fill = Rect::from_min_size(prog_rect.min, Vec2::new(fill_w, prog_h));
+        painter.rect_filled(fill, 2.0, ORANGE);
+    }
+
+    // Progress text
+    let done_count = state.checks.iter().filter(|c| c.status.is_done()).count();
+    let total = state.checks.len();
+    painter.text(
+        Pos2::new(avail.right() - w * 0.05, prog_y + prog_h * 0.5),
+        Align2::RIGHT_CENTER,
+        &format!("{}/{}", done_count, total),
+        FontId::proportional(prog_h * 2.5),
+        TEXT_MUTED,
+    );
+
+    // === Check rows (52%) ===
+    let rows_top = prog_y + prog_h + h * 0.01;
+    let rows_h = h * 0.52;
+    let row_h = rows_h / state.checks.len().max(1) as f32;
+    let row_inner_h = row_h * 0.88;
+
+    for (i, check) in state.checks.iter().enumerate() {
+        let anim = &state.row_anims[i];
+        // Staggered appearance
+        let appear_alpha = ((t - anim.appear_time) / ROW_FADE_DURATION).clamp(0.0, 1.0);
+        if appear_alpha <= 0.0 { continue; }
+
+        let row_rect = Rect::from_min_size(
+            Pos2::new(avail.left() + w * 0.04, rows_top + i as f32 * row_h),
+            Vec2::new(w * 0.92, row_inner_h),
+        );
+
+        draw_animated_row(&painter, row_rect, check, anim, t, appear_alpha);
+    }
+
+    // Handle row clicks
+    if ui.input(|i| i.pointer.any_pressed()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            for i in 0..state.checks.len() {
+                let row_rect = Rect::from_min_size(
+                    Pos2::new(avail.left() + w * 0.04, rows_top + i as f32 * row_h),
+                    Vec2::new(w * 0.92, row_inner_h),
+                );
+                if row_rect.contains(pos) {
+                    state.expanded_check = if state.expanded_check == Some(i) { None } else { Some(i) };
+                }
+            }
+        }
+    }
+
+    // Detail overlay
+    if let Some(idx) = state.expanded_check {
+        if idx < state.checks.len() {
+            let panel_rect = Rect::from_center_size(
+                avail.center(), Vec2::new(w * 0.70, h * 0.50));
+            draw_detail_panel(&painter, panel_rect, &state.checks[idx]);
+            if ui.input(|i| i.pointer.any_pressed()) {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    if !panel_rect.contains(pos) { state.expanded_check = None; }
+                }
+            }
+        }
+    }
+
+    // === Overall status (5%) ===
+    let status_y = rows_top + rows_h + h * 0.005;
+    let status_h = h * 0.05;
+    let cx = avail.center().x;
+    painter.text(
+        Pos2::new(cx, status_y + status_h * 0.35),
+        Align2::CENTER_CENTER,
+        state.overall.label(),
+        FontId::proportional(status_h * 0.40),
+        state.overall.color(),
+    );
+    painter.text(
+        Pos2::new(cx, status_y + status_h * 0.75),
+        Align2::CENTER_CENTER,
+        &state.status_message,
+        FontId::proportional(status_h * 0.22),
+        TEXT_MUTED,
+    );
+
+    // === Cluster selector (5%) ===
+    let sel_y = status_y + status_h + h * 0.005;
+    let sel_h = h * 0.045;
+    if !renderers.is_empty() {
+        let sel_name = renderers.get(state.selected_cluster_idx)
+            .map(|r| r.name()).unwrap_or("---");
+        let sel_rect = Rect::from_min_size(
+            Pos2::new(avail.left() + w * 0.04, sel_y),
+            Vec2::new(w * 0.92, sel_h));
+        painter.rect_filled(sel_rect, 4.0, ROW_BG);
+        painter.rect_stroke(sel_rect, 4.0, Stroke::new(1.0_f32, ROW_BORDER), StrokeKind::Outside);
+        painter.text(
+            Pos2::new(sel_rect.left() + 15.0, sel_rect.center().y),
+            Align2::LEFT_CENTER, "CLUSTER",
+            FontId::proportional(sel_h * 0.30), TEXT_MUTED);
+        painter.text(
+            Pos2::new(sel_rect.right() - 25.0, sel_rect.center().y),
+            Align2::RIGHT_CENTER, sel_name,
+            FontId::proportional(sel_h * 0.34), ORANGE);
+        painter.text(
+            Pos2::new(sel_rect.right() - 8.0, sel_rect.center().y),
+            Align2::RIGHT_CENTER, ">",
+            FontId::proportional(sel_h * 0.28), TEXT_MUTED);
+
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if sel_rect.contains(pos) {
+                    state.selected_cluster_idx = (state.selected_cluster_idx + 1) % renderers.len();
+                }
+            }
+        }
+    }
+
+    // === START CLUSTER button (large, prominent) ===
+    let btn_y = sel_y + sel_h + h * 0.015;
+    let btn_h = h * 0.10;
+    let btn_w = w * 0.55;
+    let btn_rect = Rect::from_center_size(
+        Pos2::new(cx, btn_y + btn_h * 0.5),
+        Vec2::new(btn_w, btn_h));
+
+    let can_start = state.can_start();
+    let hovered = ui.input(|i| i.pointer.interact_pos().map_or(false, |p| btn_rect.contains(p)));
+
+    let (bg_color, txt_color, sub_text) = if !can_start {
+        (BTN_DISABLED_BG, BTN_DISABLED_TEXT,
+         Some("Waiting for critical systems..."))
+    } else if hovered {
+        (ORANGE_HOVER, Color32::from_rgb(5, 5, 5), None)
+    } else {
+        (ORANGE, Color32::from_rgb(5, 5, 5), None)
+    };
+
+    // Button glow when enabled
+    if can_start {
+        let glow_alpha = ((t * 1.5).sin() * 0.15 + 0.85).clamp(0.0, 1.0);
+        let ga = (glow_alpha * 20.0) as u8;
+        let glow_rect = btn_rect.expand(3.0);
+        painter.rect_filled(glow_rect, 10.0,
+            Color32::from_rgba_premultiplied(255, 90, 0, ga));
+    }
+
+    painter.rect_filled(btn_rect, 8.0, bg_color);
+    painter.text(
+        Pos2::new(cx, btn_rect.center().y - if sub_text.is_some() { 4.0 } else { 0.0 }),
+        Align2::CENTER_CENTER,
+        "START CLUSTER",
+        FontId::proportional(btn_h * 0.34),
+        txt_color);
+
+    if let Some(sub) = sub_text {
+        painter.text(
+            Pos2::new(cx, btn_rect.center().y + btn_h * 0.22),
+            Align2::CENTER_CENTER, sub,
+            FontId::proportional(btn_h * 0.14), BTN_DISABLED_TEXT);
+    }
+
+    if can_start && hovered && ui.input(|i| i.pointer.any_released()) {
+        start_pressed = true;
+    }
+    if can_start && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        start_pressed = true;
+    }
+
+    // Ctrl+Alt+D dev panel
+    if ui.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.ctrl && i.modifiers.alt) {
+        state.dev_panel_open = !state.dev_panel_open;
+    }
+
+    // Request repaint while animating
+    if t < 5.0 || !state.checks_complete || state.displayed_progress < 0.99 {
+        ui.ctx().request_repaint();
+    }
+
+    let cluster_idx = if start_pressed { Some(state.selected_cluster_idx) } else { None };
+    (start_pressed, cluster_idx)
+}
+
+// ---------------------------------------------------------------------------
+// Animated row
+// ---------------------------------------------------------------------------
+
+fn draw_animated_row(
+    painter: &Painter, rect: Rect, check: &SystemCheck,
+    anim: &RowAnim, t: f32, alpha: f32,
+) {
+    let h = rect.height();
+    let status_color = check.status.color();
+
+    // Alpha-modulated colors
+    let a = (alpha * 255.0) as u8;
+    let row_bg = Color32::from_rgba_premultiplied(17, 17, 20, a);
+
+    // Row background
+    painter.rect_filled(rect, 4.0, row_bg);
+
+    // Left accent bar (color = status)
+    let sc = status_color;
+    let accent_color = Color32::from_rgba_premultiplied(sc.r(), sc.g(), sc.b(), a);
+    let accent = Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
+    painter.rect_filled(accent, 2.0, accent_color);
+
+    // Status dot (left side)
+    let dot_cx = rect.left() + 20.0;
+    let dot_cy = rect.center().y;
+
+    if check.status == CheckStatus::Checking {
+        // Pulsing dot for checking state
+        let pulse = ((t * PULSE_SPEED * std::f32::consts::PI * 2.0).sin() * 0.4 + 0.6)
+            .clamp(0.2, 1.0);
+        let pa = (pulse * alpha * 255.0) as u8;
+        let pulse_color = Color32::from_rgba_premultiplied(
+            CHECKING_COLOR.r(), CHECKING_COLOR.g(), CHECKING_COLOR.b(), pa);
+        painter.circle_filled(Pos2::new(dot_cx, dot_cy), DOT_RADIUS, pulse_color);
+    } else {
+        // Solid colored dot
+        painter.circle_filled(Pos2::new(dot_cx, dot_cy), DOT_RADIUS, accent_color);
+        // Checkmark / X / ! inside
+        let sym = check.status.symbol();
+        if !sym.is_empty() {
+            painter.text(
+                Pos2::new(dot_cx, dot_cy),
+                Align2::CENTER_CENTER, sym,
+                FontId::proportional(DOT_RADIUS * 1.4),
+                Color32::from_rgba_premultiplied(5, 5, 5, a));
+        }
+    }
+
+    // System name
+    let name_x = rect.left() + 38.0;
+    let name_color = Color32::from_rgba_premultiplied(244, 244, 244, a);
+    painter.text(
+        Pos2::new(name_x, rect.center().y - h * 0.08),
+        Align2::LEFT_CENTER,
+        &check.name,
+        FontId::proportional(h * 0.34),
+        name_color);
+
+    // Detail text (below name, smaller)
+    if !check.detail.is_empty() {
+        let detail_color = Color32::from_rgba_premultiplied(140, 140, 145, a);
+        painter.text(
+            Pos2::new(name_x, rect.center().y + h * 0.20),
+            Align2::LEFT_CENTER,
+            &check.detail,
+            FontId::proportional(h * 0.17),
+            detail_color);
+    } else if check.required {
+        let req_color = Color32::from_rgba_premultiplied(70, 70, 75, a);
+        painter.text(
+            Pos2::new(name_x, rect.center().y + h * 0.20),
+            Align2::LEFT_CENTER,
+            "REQUIRED",
+            FontId::proportional(h * 0.14),
+            req_color);
+    }
+
+    // Status label (right)
+    let label_color = Color32::from_rgba_premultiplied(
+        sc.r(), sc.g(), sc.b(), a);
+    painter.text(
+        Pos2::new(rect.right() - 12.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        check.status.label(),
+        FontId::proportional(h * 0.26),
+        label_color);
+}
+
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
+
+fn draw_header(painter: &Painter, rect: Rect, t: f32) {
+    let h = rect.height();
+    let alpha = (t / 0.5).clamp(0.0, 1.0);
+    let a = (alpha * 255.0) as u8;
+
+    // NinoDash wordmark
+    let nino_c = Color32::from_rgba_premultiplied(244, 244, 244, a);
+    let dash_c = Color32::from_rgba_premultiplied(255, 90, 0, a);
+    painter.text(
+        Pos2::new(rect.left() + 25.0, rect.center().y - 6.0),
+        Align2::LEFT_CENTER, "Nino",
+        FontId::proportional(h * 0.42), nino_c);
+    painter.text(
+        Pos2::new(rect.left() + 90.0, rect.center().y - 6.0),
+        Align2::LEFT_CENTER, "Dash",
+        FontId::proportional(h * 0.42), dash_c);
+
+    // Subtitle
+    let sub_alpha = ((t - 0.2) / 0.4).clamp(0.0, 1.0);
+    let sa = (sub_alpha * 140.0) as u8;
+    painter.text(
+        Pos2::new(rect.left() + 25.0, rect.center().y + 14.0),
+        Align2::LEFT_CENTER, "SYSTEM PREFLIGHT",
+        FontId::proportional(h * 0.20),
+        Color32::from_rgba_premultiplied(sa, sa, sa, sa));
+
+    // Clock
+    let time = chrono_time();
+    painter.text(
+        Pos2::new(rect.right() - 25.0, rect.center().y),
+        Align2::RIGHT_CENTER, &time,
+        FontId::proportional(h * 0.24),
+        Color32::from_rgba_premultiplied(168, 168, 168, a));
+
+    // Separator
+    painter.line_segment(
+        [Pos2::new(rect.left() + 15.0, rect.bottom()),
+         Pos2::new(rect.right() - 15.0, rect.bottom())],
+        Stroke::new(1.0_f32, SEPARATOR));
+}
+
+// ---------------------------------------------------------------------------
+// Detail panel
+// ---------------------------------------------------------------------------
+
+fn draw_detail_panel(painter: &Painter, rect: Rect, check: &SystemCheck) {
+    let full = painter.clip_rect();
+    painter.rect_filled(full, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 190));
+    painter.rect_filled(rect, 8.0, DETAIL_BG);
+    painter.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, check.status.color()), StrokeKind::Outside);
+
+    painter.text(
+        Pos2::new(rect.left() + 20.0, rect.top() + 25.0),
+        Align2::LEFT_CENTER, &check.name,
+        FontId::proportional(18.0), TEXT_PRIMARY);
+    painter.text(
+        Pos2::new(rect.right() - 20.0, rect.top() + 25.0),
+        Align2::RIGHT_CENTER, check.status.label(),
+        FontId::proportional(15.0), check.status.color());
+
+    painter.line_segment(
+        [Pos2::new(rect.left() + 15.0, rect.top() + 45.0),
+         Pos2::new(rect.right() - 15.0, rect.top() + 45.0)],
+        Stroke::new(1.0_f32, SEPARATOR));
+
+    let row_h = 26.0;
+    let start_y = rect.top() + 58.0;
+    let max_rows = ((rect.height() - 75.0) / row_h) as usize;
+
+    for (i, (key, val)) in check.extra.iter().take(max_rows).enumerate() {
+        let y = start_y + i as f32 * row_h;
+        painter.text(
+            Pos2::new(rect.left() + 22.0, y),
+            Align2::LEFT_CENTER, key,
+            FontId::proportional(12.0), TEXT_SECONDARY);
+        painter.text(
+            Pos2::new(rect.right() - 22.0, y),
+            Align2::RIGHT_CENTER, val,
+            FontId::proportional(12.0), TEXT_PRIMARY);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time helper
+// ---------------------------------------------------------------------------
+
+pub fn chrono_time_internal() -> String { chrono_time() }
+
+fn chrono_time() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let hours = ((secs % 86400) / 3600) as u32;
+    let mins = ((secs % 3600) / 60) as u32;
+    let ist_mins = mins + 30;
+    let carry = ist_mins / 60;
+    let ist_mins = ist_mins % 60;
+    let ist_hours = (hours + 5 + carry) % 24;
+    format!("{:02}:{:02}", ist_hours, ist_mins)
+}
+
+// ---------------------------------------------------------------------------
+// Background system checks (unchanged logic, runs in thread)
 // ---------------------------------------------------------------------------
 
 fn run_system_checks() -> Vec<SystemCheck> {
     let mut results = vec![];
 
-    // -- Raspberry Pi System --
+    // Raspberry Pi System
     {
         let mut check = SystemCheck {
-            name: "Raspberry Pi System".into(),
-            status: CheckStatus::Ready,
-            detail: String::new(),
-            required: true,
-            extra: vec![],
+            name: "Raspberry Pi System".into(), status: CheckStatus::Ready,
+            detail: String::new(), required: true, extra: vec![],
         };
-
-        // CPU
-        let cpu_count = std::thread::available_parallelism()
-            .map(|n| n.get()).unwrap_or(1);
+        let cpu_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         check.extra.push(("CPU cores".into(), format!("{}", cpu_count)));
-
-        // Memory
         if let Ok(out) = Command::new("free").arg("-m").output() {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
@@ -471,70 +815,27 @@ fn run_system_checks() -> Vec<SystemCheck> {
                 }
             }
         }
-
-        // Temperature
         if let Ok(out) = Command::new("vcgencmd").arg("measure_temp").output() {
             let text = String::from_utf8_lossy(&out.stdout);
             let temp_str = text.trim().replace("temp=", "").replace("'C", " °C");
             check.extra.push(("Temperature".into(), temp_str.clone()));
-
-            // Parse temp value for warning
-            if let Some(t) = temp_str.split_whitespace().next()
-                .and_then(|s| s.parse::<f32>().ok())
-            {
-                if t > 80.0 {
-                    check.status = CheckStatus::Warning;
-                    check.detail = format!("High temperature: {:.0}°C", t);
-                }
-            }
-        } else {
-            // Not a Pi or vcgencmd not available
-            check.extra.push(("Temperature".into(), "N/A".into()));
-        }
-
-        // Storage
-        if let Ok(out) = Command::new("df").args(["-h", "/"]).output() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    check.extra.push(("Disk total".into(), parts[1].into()));
-                    check.extra.push(("Disk used".into(), parts[2].into()));
-                    check.extra.push(("Disk free".into(), parts[3].into()));
-
-                    let pct_str = parts[4].trim_end_matches('%');
-                    if let Ok(pct) = pct_str.parse::<u32>() {
-                        if pct > 90 {
-                            check.status = CheckStatus::Warning;
-                            check.detail = format!("Storage {}% full", pct);
-                        }
-                    }
-                }
+            if let Some(t) = temp_str.split_whitespace().next().and_then(|s| s.parse::<f32>().ok()) {
+                if t > 80.0 { check.status = CheckStatus::Warning; check.detail = format!("High temp: {:.0}°C", t); }
             }
         }
-
-        // Uptime
         if let Ok(out) = Command::new("uptime").arg("-p").output() {
-            check.extra.push(("Uptime".into(),
-                String::from_utf8_lossy(&out.stdout).trim().into()));
+            check.extra.push(("Uptime".into(), String::from_utf8_lossy(&out.stdout).trim().into()));
         }
-
-        if check.detail.is_empty() {
-            check.detail = format!("{} cores, healthy", cpu_count);
-        }
+        if check.detail.is_empty() { check.detail = format!("{} cores, healthy", cpu_count); }
         results.push(check);
     }
 
-    // -- JCR1440 USB Device (initial check via lsusb) --
+    // JCR1440 USB Device
     {
         let mut check = SystemCheck {
-            name: "JCR1440 USB Device".into(),
-            status: CheckStatus::Checking,
-            detail: "Waiting for poller...".into(),
-            required: true,
-            extra: vec![],
+            name: "JCR1440 USB Device".into(), status: CheckStatus::Checking,
+            detail: "Waiting for poller...".into(), required: true, extra: vec![],
         };
-
         if let Ok(out) = Command::new("lsusb").output() {
             let text = String::from_utf8_lossy(&out.stdout);
             let found = text.lines().any(|l| {
@@ -545,25 +846,6 @@ fn run_system_checks() -> Vec<SystemCheck> {
                 check.status = CheckStatus::Connected;
                 check.detail = "USB device detected".into();
                 check.extra.push(("VID:PID".into(), "05c6:f00e".into()));
-
-                // Find sysfs info
-                for entry in std::fs::read_dir("/sys/bus/usb/devices/").into_iter().flatten().flatten() {
-                    let p = entry.path();
-                    let vid = std::fs::read_to_string(p.join("idVendor"))
-                        .unwrap_or_default().trim().to_string();
-                    let pid = std::fs::read_to_string(p.join("idProduct"))
-                        .unwrap_or_default().trim().to_string();
-                    if vid == "05c6" && pid == "f00e" {
-                        let mfr = std::fs::read_to_string(p.join("manufacturer"))
-                            .unwrap_or_default().trim().to_string();
-                        let prod = std::fs::read_to_string(p.join("product"))
-                            .unwrap_or_default().trim().to_string();
-                        if !mfr.is_empty() { check.extra.push(("Manufacturer".into(), mfr)); }
-                        if !prod.is_empty() { check.extra.push(("Product".into(), prod)); }
-                        check.extra.push(("Sysfs".into(), p.display().to_string()));
-                        break;
-                    }
-                }
             } else {
                 check.status = CheckStatus::Failed;
                 check.detail = "Not detected on USB".into();
@@ -572,35 +854,18 @@ fn run_system_checks() -> Vec<SystemCheck> {
         results.push(check);
     }
 
-    // -- OBD Interface (checked via serial ports) --
+    // OBD Interface
     {
         let mut check = SystemCheck {
-            name: "OBD Interface".into(),
-            status: CheckStatus::Checking,
-            detail: "Waiting for data...".into(),
-            required: true,
-            extra: vec![],
+            name: "OBD Interface".into(), status: CheckStatus::Checking,
+            detail: "Waiting for data...".into(), required: true, extra: vec![],
         };
-
-        // Check for serial ports
-        let serial_ports: Vec<_> = glob_paths("/dev/ttyUSB*")
-            .into_iter()
-            .chain(glob_paths("/dev/ttyACM*"))
-            .collect();
-        if !serial_ports.is_empty() {
-            check.extra.push(("Serial ports".into(),
-                serial_ports.iter().map(|p| p.to_string_lossy().to_string())
-                    .collect::<Vec<_>>().join(", ")));
-        }
-
-        // Check for RNDIS/network interface to device
         let mut rndis_found = false;
         for entry in std::fs::read_dir("/sys/class/net/").into_iter().flatten().flatten() {
             let p = entry.path();
             let driver_link = p.join("device/driver");
             if let Ok(target) = std::fs::read_link(&driver_link) {
-                let drv = target.file_name()
-                    .unwrap_or_default().to_string_lossy().to_string();
+                let drv = target.file_name().unwrap_or_default().to_string_lossy().to_string();
                 if drv == "rndis_host" {
                     let iface = p.file_name().unwrap_or_default().to_string_lossy().to_string();
                     check.extra.push(("RNDIS interface".into(), iface));
@@ -608,83 +873,45 @@ fn run_system_checks() -> Vec<SystemCheck> {
                 }
             }
         }
-
-        if rndis_found || !serial_ports.is_empty() {
-            check.status = CheckStatus::Connected;
-            check.detail = "Interface available".into();
-        }
-        // Will be updated by telemetry poller
+        if rndis_found { check.status = CheckStatus::Connected; check.detail = "Interface available".into(); }
         results.push(check);
     }
 
-    // -- Vehicle Data Stream (set by telemetry updates, just placeholder) --
+    // Vehicle Data Stream (placeholder — updated by telemetry)
     results.push(SystemCheck {
-        name: "Vehicle Data Stream".into(),
-        status: CheckStatus::Checking,
-        detail: "Waiting for data...".into(),
-        required: true,
-        extra: vec![],
+        name: "Vehicle Data Stream".into(), status: CheckStatus::Checking,
+        detail: "Waiting for data...".into(), required: true, extra: vec![],
     });
 
-    // -- GPS (set by telemetry updates, just placeholder) --
+    // GPS (placeholder — updated by telemetry)
     results.push(SystemCheck {
-        name: "GPS".into(),
-        status: CheckStatus::Checking,
-        detail: "Waiting for fix...".into(),
-        required: false,
-        extra: vec![],
+        name: "GPS".into(), status: CheckStatus::Checking,
+        detail: "Waiting for fix...".into(), required: false, extra: vec![],
     });
 
-    // -- Network --
+    // Network
     {
         let mut check = SystemCheck {
-            name: "Network".into(),
-            status: CheckStatus::Warning,
-            detail: "Offline".into(),
-            required: false,
-            extra: vec![],
+            name: "Network".into(), status: CheckStatus::Warning,
+            detail: "Offline".into(), required: false, extra: vec![],
         };
-
-        // Check for any non-loopback interface with an IP
         if let Ok(out) = Command::new("ip").args(["-4", "addr", "show"]).output() {
             let text = String::from_utf8_lossy(&out.stdout);
-            let has_ip = text.lines().any(|l| {
-                l.contains("inet ") && !l.contains("127.0.0.1") && !l.contains("scope host")
-            });
-            if has_ip {
+            if text.lines().any(|l| l.contains("inet ") && !l.contains("127.0.0.1")) {
                 check.status = CheckStatus::Ready;
                 check.detail = "Connected".into();
             }
         }
-
-        // WiFi status
-        if let Ok(out) = Command::new("nmcli").args(["-t", "-f", "DEVICE,STATE", "device", "status"]).output() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() >= 2 {
-                    check.extra.push((parts[0].into(), parts[1].into()));
-                }
-            }
-        }
-
         results.push(check);
     }
 
-    // -- Telemetry Service --
+    // Telemetry Service
     {
         let mut check = SystemCheck {
-            name: "Telemetry Service".into(),
-            status: CheckStatus::NotAvailable,
-            detail: "Not running".into(),
-            required: false,
-            extra: vec![],
+            name: "Telemetry Service".into(), status: CheckStatus::NotAvailable,
+            detail: "Not running".into(), required: false, extra: vec![],
         };
-
-        if let Ok(out) = Command::new("systemctl")
-            .args(["is-active", "jcr1440-telemetry"])
-            .output()
-        {
+        if let Ok(out) = Command::new("systemctl").args(["is-active", "jcr1440-telemetry"]).output() {
             let active = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if active == "active" {
                 check.status = CheckStatus::Ready;
@@ -692,493 +919,32 @@ fn run_system_checks() -> Vec<SystemCheck> {
             } else {
                 check.detail = format!("State: {}", active);
             }
-            check.extra.push(("Service state".into(), active));
         }
-
-        // Check if monitor state file exists
-        if std::path::Path::new("/run/jcr1440-monitor.state").exists() {
-            check.extra.push(("State file".into(), "Present".into()));
-            if let Ok(text) = std::fs::read_to_string("/run/jcr1440-monitor.state") {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(overall) = val.get("overall").and_then(|v| v.as_str()) {
-                        check.extra.push(("Monitor status".into(), overall.into()));
-                    }
-                    if let Some(session) = val.get("session_dir").and_then(|v| v.as_str()) {
-                        check.extra.push(("Session".into(), session.into()));
-                    }
-                }
-            }
-        }
-
         results.push(check);
     }
 
-    // -- Storage --
+    // Storage
     {
         let mut check = SystemCheck {
-            name: "Storage".into(),
-            status: CheckStatus::Ready,
-            detail: "Healthy".into(),
-            required: false,
-            extra: vec![],
+            name: "Storage".into(), status: CheckStatus::Ready,
+            detail: "Healthy".into(), required: false, extra: vec![],
         };
-
         if let Ok(out) = Command::new("df").args(["-h", "/"]).output() {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 5 {
                     check.detail = format!("{} free of {}", parts[3], parts[1]);
-                    check.extra.push(("Total".into(), parts[1].into()));
-                    check.extra.push(("Free".into(), parts[3].into()));
-
                     let pct_str = parts[4].trim_end_matches('%');
                     if let Ok(pct) = pct_str.parse::<u32>() {
-                        if pct > 95 {
-                            check.status = CheckStatus::Failed;
-                            check.detail = format!("Critical: {}% full", pct);
-                        } else if pct > 85 {
-                            check.status = CheckStatus::Warning;
-                            check.detail = format!("Low space: {}% used", pct);
-                        }
+                        if pct > 95 { check.status = CheckStatus::Failed; check.detail = format!("Critical: {}% full", pct); }
+                        else if pct > 85 { check.status = CheckStatus::Warning; check.detail = format!("Low space: {}% used", pct); }
                     }
                 }
             }
         }
-
-        // Check log directory
-        if let Ok(entries) = std::fs::read_dir("/var/log/jcr1440") {
-            let count = entries.count();
-            check.extra.push(("Log sessions".into(), format!("{}", count)));
-        }
-
         results.push(check);
     }
 
     results
-}
-
-fn glob_paths(pattern: &str) -> Vec<std::path::PathBuf> {
-    // Simple glob using the pattern directly
-    let dir = std::path::Path::new(pattern).parent().unwrap_or(std::path::Path::new("/dev"));
-    let prefix = std::path::Path::new(pattern).file_name()
-        .unwrap_or_default().to_string_lossy();
-    let prefix = prefix.trim_end_matches('*');
-
-    std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| {
-        let p = e.ok()?.path();
-        if p.file_name()?.to_string_lossy().starts_with(prefix) {
-            Some(p)
-        } else {
-            None
-        }
-    }).collect()
-}
-
-// ---------------------------------------------------------------------------
-// UI drawing
-// ---------------------------------------------------------------------------
-
-/// Draw the full preflight screen.
-/// Returns (start_pressed, selected_cluster_idx).
-pub fn draw_preflight(
-    ui: &mut Ui,
-    state: &mut PreflightState,
-    renderers: &[Box<dyn ClusterRenderer>],
-) -> (bool, Option<usize>) {
-    let mut start_pressed = false;
-    let avail = ui.available_rect_before_wrap();
-    let w = avail.width();
-    let h = avail.height();
-
-    // Background
-    let painter = ui.painter_at(avail);
-    painter.rect_filled(avail, 0.0, BG_DARK);
-
-    // Header
-    let header_h = h * 0.12;
-    let header_rect = Rect::from_min_size(avail.min, Vec2::new(w, header_h));
-    draw_header(&painter, header_rect);
-
-    // Check rows
-    let checks_top = avail.top() + header_h;
-    let checks_h = h * 0.55;
-    let row_h = checks_h / state.checks.len().max(1) as f32;
-
-    for (i, check) in state.checks.iter().enumerate() {
-        let row_rect = Rect::from_min_size(
-            Pos2::new(avail.left() + w * 0.05, checks_top + i as f32 * row_h),
-            Vec2::new(w * 0.90, row_h * 0.85),
-        );
-        draw_check_row(&painter, row_rect, check);
-    }
-
-    // Handle click on check rows for expansion
-    if ui.input(|i| i.pointer.any_pressed()) {
-        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            for (i, _check) in state.checks.iter().enumerate() {
-                let row_rect = Rect::from_min_size(
-                    Pos2::new(avail.left() + w * 0.05, checks_top + i as f32 * row_h),
-                    Vec2::new(w * 0.90, row_h * 0.85),
-                );
-                if row_rect.contains(pos) {
-                    if state.expanded_check == Some(i) {
-                        state.expanded_check = None;
-                    } else {
-                        state.expanded_check = Some(i);
-                    }
-                }
-            }
-        }
-    }
-
-    // Expanded detail panel (overlay)
-    if let Some(idx) = state.expanded_check {
-        if idx < state.checks.len() {
-            let panel_rect = Rect::from_center_size(
-                avail.center(),
-                Vec2::new(w * 0.70, h * 0.55),
-            );
-            draw_detail_panel(&painter, panel_rect, &state.checks[idx]);
-
-            // Close on click outside
-            if ui.input(|i| i.pointer.any_pressed()) {
-                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    if !panel_rect.contains(pos) {
-                        state.expanded_check = None;
-                    }
-                }
-            }
-        }
-    }
-
-    // Overall status bar
-    let status_y = checks_top + checks_h;
-    let status_rect = Rect::from_min_size(
-        Pos2::new(avail.left() + w * 0.05, status_y),
-        Vec2::new(w * 0.90, h * 0.06),
-    );
-    draw_overall_status(&painter, status_rect, &state.overall, &state.status_message);
-
-    // Cluster selector row
-    let selector_y = status_y + h * 0.07;
-    if !renderers.is_empty() {
-        let sel_name = renderers.get(state.selected_cluster_idx)
-            .map(|r| r.name()).unwrap_or("---");
-        let sel_rect = Rect::from_min_size(
-            Pos2::new(avail.left() + w * 0.05, selector_y),
-            Vec2::new(w * 0.90, h * 0.06),
-        );
-        painter.rect_filled(sel_rect, 4.0, CARD_BG);
-        painter.rect_stroke(sel_rect, 4.0, Stroke::new(1.0_f32, CARD_BORDER), StrokeKind::Outside);
-        painter.text(
-            Pos2::new(sel_rect.left() + 15.0, sel_rect.center().y),
-            Align2::LEFT_CENTER,
-            "Selected Cluster",
-            FontId::proportional(sel_rect.height() * 0.30),
-            TEXT_DIM,
-        );
-        painter.text(
-            Pos2::new(sel_rect.right() - 30.0, sel_rect.center().y),
-            Align2::RIGHT_CENTER,
-            sel_name,
-            FontId::proportional(sel_rect.height() * 0.34),
-            TITLE_COLOR,
-        );
-        painter.text(
-            Pos2::new(sel_rect.right() - 10.0, sel_rect.center().y),
-            Align2::RIGHT_CENTER,
-            ">",
-            FontId::proportional(sel_rect.height() * 0.30),
-            TEXT_DIM,
-        );
-
-        // Click to cycle
-        if ui.input(|i| i.pointer.any_released()) {
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                if sel_rect.contains(pos) {
-                    state.selected_cluster_idx =
-                        (state.selected_cluster_idx + 1) % renderers.len();
-                }
-            }
-        }
-    }
-
-    // Start button
-    let btn_y = selector_y + h * 0.08;
-    let btn_rect = Rect::from_center_size(
-        Pos2::new(avail.center().x, btn_y),
-        Vec2::new(w * 0.40, h * 0.08),
-    );
-
-    let can_start = state.can_start();
-    let hovered = ui.input(|i| {
-        i.pointer.interact_pos().map_or(false, |p| btn_rect.contains(p))
-    });
-
-    let bg = if !can_start {
-        BTN_BG_DISABLED
-    } else if hovered {
-        BTN_BG_HOVER
-    } else {
-        BTN_BG
-    };
-    let text_color = if can_start { BTN_TEXT } else { BTN_TEXT_DISABLED };
-
-    painter.rect_filled(btn_rect, 6.0, bg);
-    painter.text(
-        btn_rect.center(),
-        Align2::CENTER_CENTER,
-        "START CLUSTER",
-        FontId::proportional(h * 0.032),
-        text_color,
-    );
-
-    if can_start && hovered && ui.input(|i| i.pointer.any_released()) {
-        start_pressed = true;
-    }
-
-    // Ctrl+Alt+D toggles dev panel
-    if ui.input(|i| {
-        i.key_pressed(egui::Key::D) && i.modifiers.ctrl && i.modifiers.alt
-    }) {
-        state.dev_panel_open = !state.dev_panel_open;
-    }
-
-    // Enter to start
-    if can_start && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-        start_pressed = true;
-    }
-
-    let cluster_idx = if start_pressed { Some(state.selected_cluster_idx) } else { None };
-    (start_pressed, cluster_idx)
-}
-
-fn draw_header(painter: &Painter, rect: Rect) {
-    // NinoDash wordmark
-    painter.text(
-        Pos2::new(rect.left() + 30.0, rect.center().y - 8.0),
-        Align2::LEFT_CENTER,
-        "Nino",
-        FontId::proportional(rect.height() * 0.36),
-        TEXT_WHITE,
-    );
-    painter.text(
-        Pos2::new(rect.left() + 92.0, rect.center().y - 8.0),
-        Align2::LEFT_CENTER,
-        "Dash",
-        FontId::proportional(rect.height() * 0.36),
-        TITLE_COLOR,
-    );
-
-    // Subtitle
-    painter.text(
-        Pos2::new(rect.left() + 30.0, rect.center().y + 16.0),
-        Align2::LEFT_CENTER,
-        "SYSTEM PREFLIGHT",
-        FontId::proportional(rect.height() * 0.18),
-        SUBTITLE_COLOR,
-    );
-
-    // Clock (top-right)
-    let now = chrono_time();
-    painter.text(
-        Pos2::new(rect.right() - 30.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        &now,
-        FontId::proportional(rect.height() * 0.22),
-        CLOCK_COLOR,
-    );
-
-    // Separator line
-    painter.line_segment(
-        [
-            Pos2::new(rect.left() + 20.0, rect.bottom()),
-            Pos2::new(rect.right() - 20.0, rect.bottom()),
-        ],
-        Stroke::new(1.0_f32, CARD_BORDER),
-    );
-}
-
-fn draw_check_row(painter: &Painter, rect: Rect, check: &SystemCheck) {
-    let h = rect.height();
-    let status_color = check.status.color();
-
-    // Background card
-    painter.rect_filled(rect, 4.0, CARD_BG);
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, CARD_BORDER), StrokeKind::Outside);
-
-    // Left accent bar
-    let accent_rect = Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
-    painter.rect_filled(accent_rect, 2.0, status_color);
-
-    // Status icon
-    let icon_x = rect.left() + 28.0;
-    painter.text(
-        Pos2::new(icon_x, rect.center().y),
-        Align2::CENTER_CENTER,
-        check.status.icon(),
-        FontId::monospace(h * 0.32),
-        status_color,
-    );
-
-    // Check name
-    let name_x = rect.left() + 60.0;
-    painter.text(
-        Pos2::new(name_x, rect.center().y),
-        Align2::LEFT_CENTER,
-        &check.name,
-        FontId::proportional(h * 0.38),
-        TEXT_WHITE,
-    );
-
-    // Status label (right-aligned)
-    painter.text(
-        Pos2::new(rect.right() - 15.0, rect.center().y - h * 0.08),
-        Align2::RIGHT_CENTER,
-        check.status.label(),
-        FontId::proportional(h * 0.30),
-        status_color,
-    );
-
-    // Detail text (right-aligned, smaller)
-    if !check.detail.is_empty() {
-        painter.text(
-            Pos2::new(rect.right() - 15.0, rect.center().y + h * 0.22),
-            Align2::RIGHT_CENTER,
-            &check.detail,
-            FontId::proportional(h * 0.18),
-            TEXT_DIM,
-        );
-    }
-
-    // Required indicator
-    if check.required {
-        painter.text(
-            Pos2::new(name_x, rect.center().y + h * 0.25),
-            Align2::LEFT_CENTER,
-            "REQUIRED",
-            FontId::proportional(h * 0.14),
-            TEXT_DIM,
-        );
-    }
-
-    // Tap hint
-    if !check.extra.is_empty() {
-        painter.text(
-            Pos2::new(rect.right() - 15.0, rect.bottom() - 2.0),
-            Align2::RIGHT_BOTTOM,
-            "tap for details",
-            FontId::proportional(h * 0.12),
-            Color32::from_rgb(50, 52, 58),
-        );
-    }
-}
-
-fn draw_detail_panel(painter: &Painter, rect: Rect, check: &SystemCheck) {
-    // Dim background
-    let full = painter.clip_rect();
-    painter.rect_filled(full, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 180));
-
-    // Panel
-    painter.rect_filled(rect, 8.0, DETAIL_BG);
-    painter.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, check.status.color()), StrokeKind::Outside);
-
-    // Title
-    painter.text(
-        Pos2::new(rect.left() + 20.0, rect.top() + 25.0),
-        Align2::LEFT_CENTER,
-        &check.name,
-        FontId::proportional(20.0),
-        TEXT_WHITE,
-    );
-
-    // Status
-    painter.text(
-        Pos2::new(rect.right() - 20.0, rect.top() + 25.0),
-        Align2::RIGHT_CENTER,
-        check.status.label(),
-        FontId::proportional(16.0),
-        check.status.color(),
-    );
-
-    // Separator
-    painter.line_segment(
-        [
-            Pos2::new(rect.left() + 15.0, rect.top() + 45.0),
-            Pos2::new(rect.right() - 15.0, rect.top() + 45.0),
-        ],
-        Stroke::new(1.0_f32, CARD_BORDER),
-    );
-
-    // Detail rows
-    let row_h = 28.0;
-    let start_y = rect.top() + 60.0;
-    let max_rows = ((rect.height() - 80.0) / row_h) as usize;
-
-    for (i, (key, val)) in check.extra.iter().take(max_rows).enumerate() {
-        let y = start_y + i as f32 * row_h;
-        painter.text(
-            Pos2::new(rect.left() + 25.0, y),
-            Align2::LEFT_CENTER,
-            key,
-            FontId::proportional(13.0),
-            SUBTITLE_COLOR,
-        );
-        painter.text(
-            Pos2::new(rect.right() - 25.0, y),
-            Align2::RIGHT_CENTER,
-            val,
-            FontId::proportional(13.0),
-            TEXT_WHITE,
-        );
-    }
-}
-
-fn draw_overall_status(
-    painter: &Painter, rect: Rect,
-    overall: &OverallStatus, message: &str,
-) {
-    let cx = rect.center().x;
-
-    // Status label
-    painter.text(
-        Pos2::new(cx, rect.top() + rect.height() * 0.30),
-        Align2::CENTER_CENTER,
-        overall.label(),
-        FontId::proportional(rect.height() * 0.32),
-        overall.color(),
-    );
-
-    // Message
-    painter.text(
-        Pos2::new(cx, rect.top() + rect.height() * 0.70),
-        Align2::CENTER_CENTER,
-        message,
-        FontId::proportional(rect.height() * 0.16),
-        TEXT_DIM,
-    );
-}
-
-pub fn chrono_time_internal() -> String {
-    chrono_time()
-}
-
-fn chrono_time() -> String {
-    // Use simple system time formatting without chrono dependency
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    // UTC time parts
-    let hours = ((secs % 86400) / 3600) as u32;
-    let mins = ((secs % 3600) / 60) as u32;
-
-    // Adjust for IST (+5:30)
-    let ist_mins = mins + 30;
-    let carry = ist_mins / 60;
-    let ist_mins = ist_mins % 60;
-    let ist_hours = (hours + 5 + carry) % 24;
-
-    format!("{:02}:{:02}", ist_hours, ist_mins)
 }

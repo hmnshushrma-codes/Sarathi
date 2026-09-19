@@ -16,6 +16,7 @@
 
 mod parse;
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use md5::{Digest, Md5};
@@ -80,6 +81,32 @@ impl Default for DeviceConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Interface resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a network interface name (e.g. "enxfcde56ff0106") to its IPv4 address
+/// by parsing the output of `ip -4 -o addr show <iface>`.
+fn resolve_interface_addr(iface: &str) -> Option<IpAddr> {
+    let output = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", iface])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Format: "3: enxfcde56ff0106    inet 192.168.1.100/24 brd ..."
+    // Find the token after "inet" and strip the CIDR prefix length.
+    let mut tokens = text.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "inet" {
+            if let Some(cidr) = tokens.next() {
+                let ip_str = cidr.split('/').next()?;
+                return ip_str.parse::<IpAddr>().ok();
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -93,12 +120,24 @@ pub struct Jcr1440Client {
 impl Jcr1440Client {
     pub fn new(config: DeviceConfig) -> Result<Self> {
         // reqwest's cookie store handles SessionID automatically.
-        let http = Client::builder()
+        // Bind to the RNDIS interface IP so traffic goes to the dongle,
+        // not the home router on the same 192.168.1.0/24 subnet.
+        let mut builder = Client::builder()
             .cookie_store(true)
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            // The Host header override is applied per-request.
-            .build()?;
+            .timeout(Duration::from_secs(10));
+
+        if let Some(addr) = resolve_interface_addr(&config.interface) {
+            info!("Binding HTTP client to {} ({})", config.interface, addr);
+            builder = builder.local_address(addr);
+        } else {
+            warn!(
+                "Could not resolve IP for interface '{}'; requests may route to wrong device",
+                config.interface
+            );
+        }
+
+        let http = builder.build()?;
 
         let csrf_re =
             Regex::new(r#"id="csrf_token2"[^>]*value="([^"]+)""#).expect("static regex");

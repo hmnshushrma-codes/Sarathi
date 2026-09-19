@@ -63,6 +63,13 @@ if [ -f "${SCRIPT_DIR}/assets/nino_dash.png" ]; then
 fi
 echo "  Binary: /opt/jcr1440/jcr1440-cluster"
 
+# 4b. Install udev rule for USB mode switching
+if [ -f "${SCRIPT_DIR}/deploy/pi/99-jcr1440-modeswitch.rules" ]; then
+    cp "${SCRIPT_DIR}/deploy/pi/99-jcr1440-modeswitch.rules" /etc/udev/rules.d/
+    udevadm control --reload-rules 2>/dev/null || true
+    echo "  udev rule installed (auto RNDIS mode switch)."
+fi
+
 # 5. Install telemetry monitor
 echo "[5/7] Installing telemetry monitor..."
 mkdir -p /opt/jcr1440-monitor /var/log/jcr1440

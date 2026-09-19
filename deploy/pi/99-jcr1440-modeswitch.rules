@@ -1,0 +1,6 @@
+# JCR1440 OBD-II dongle — auto-switch from mass storage (f000) to RNDIS (f00e)
+# When the device connects in mass storage mode, switch it to RNDIS so the
+# network interface appears and telemetry data can flow.
+
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05c6", ATTR{idProduct}=="f000", \
+    RUN+="/usr/sbin/usb_modeswitch -v 05c6 -p f000 -V 05c6 -P f00e -M '5553424312345678000000000000061b000000020000000000000000000000'"

@@ -331,7 +331,7 @@ impl PreflightState {
                     }
                 }
 
-                // GPS
+                // GPS — show as ready if satellites visible, even without position fix
                 if let Some(c) = self.checks.iter_mut().find(|c| c.name == "GPS") {
                     if frame.gps.fix_valid && frame.gps.satellites > 0 {
                         c.status = CheckStatus::Ready;
@@ -343,12 +343,21 @@ impl PreflightState {
                             ("HDOP".into(), format!("{:.1}", frame.gps.hdop)),
                             ("Accuracy".into(), format!("{:.0} m", frame.gps.accuracy)),
                         ];
+                    } else if frame.gps.satellites > 0 {
+                        // GPS module active, has satellites but no position fix yet
+                        c.status = CheckStatus::Ready;
+                        c.detail = format!("Active: {} sats, no fix", frame.gps.satellites);
+                        c.extra = vec![
+                            ("Fix".into(), "NO (searching)".into()),
+                            ("Satellites".into(), format!("{}", frame.gps.satellites)),
+                            ("Module".into(), "ACTIVE".into()),
+                        ];
                     } else {
                         c.status = CheckStatus::Warning;
-                        c.detail = "No GPS fix".into();
+                        c.detail = "No GPS signal".into();
                         c.extra = vec![
                             ("Fix".into(), "NO".into()),
-                            ("Satellites".into(), format!("{}", frame.gps.satellites)),
+                            ("Satellites".into(), "0".into()),
                         ];
                     }
                 }

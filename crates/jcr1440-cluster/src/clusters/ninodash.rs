@@ -355,27 +355,28 @@ fn draw_status_bar(painter: &Painter, rect: Rect, data: &ClusterLayout) {
     let h = rect.height();
     let cx = rect.center().x;
 
-    // GPS status — left
-    let gps_ok = data.gps.as_ref().map_or(false, |g| g.fix_valid && g.satellites > 0);
+    // GPS status + coordinates — left
+    let gps_active = data.gps.as_ref().map_or(false, |g| g.satellites > 0);
+    let gps_fix = data.gps.as_ref().map_or(false, |g| g.fix_valid);
     let gps_text = if let Some(ref gps) = data.gps {
-        if gps.fix_valid { format!("GPS {}sat", gps.satellites) }
-        else { "GPS --".into() }
+        if gps.fix_valid {
+            format!("GPS {:.4}°, {:.4}° | {}sat",
+                gps.latitude, gps.longitude, gps.satellites)
+        } else if gps.satellites > 0 {
+            format!("GPS {}sat (searching)", gps.satellites)
+        } else {
+            "GPS --".into()
+        }
     } else { "GPS --".into() };
+    let gps_color = if gps_fix { theme::STATUS_OK }
+        else if gps_active { theme::ORANGE }
+        else { LABEL_DIM };
     painter.text(
         Pos2::new(rect.left() + 20.0, rect.center().y),
         Align2::LEFT_CENTER,
         &gps_text,
-        FontId::proportional(h * 0.32),
-        if gps_ok { theme::STATUS_OK } else { LABEL_DIM },
-    );
-
-    // IAT — center left
-    painter.text(
-        Pos2::new(cx - 120.0, rect.center().y),
-        Align2::CENTER_CENTER,
-        &format!("+{:.0}°C", data.intake_temp),
-        FontId::proportional(h * 0.32),
-        VALUE_COLOR,
+        FontId::proportional(h * 0.28),
+        gps_color,
     );
 
     // Time — center

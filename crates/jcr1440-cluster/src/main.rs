@@ -19,6 +19,7 @@ use tokio::sync::watch;
 
 mod clusters;
 mod gauges;
+mod gps_logger;
 mod preflight;
 mod splash;
 mod switcher;
@@ -171,6 +172,8 @@ struct NinoDashApp {
     // Data loss recovery
     data_lost_since: Option<Instant>,
     data_restored_at: Option<Instant>,
+    // GPS track logger
+    gps_logger: gps_logger::GpsLogger,
 }
 
 impl NinoDashApp {
@@ -201,6 +204,7 @@ impl NinoDashApp {
             error_msg: None,
             data_lost_since: None,
             data_restored_at: None,
+            gps_logger: gps_logger::GpsLogger::new(),
         }
     }
 
@@ -209,6 +213,8 @@ impl NinoDashApp {
         match state {
             DeviceState::Live(frame) => {
                 self.gauges.update(&frame.obd);
+                // Log GPS track
+                self.gps_logger.log_point(&frame.gps);
                 if !self.connected {
                     self.data_restored_at = Some(Instant::now());
                     self.data_lost_since = None;

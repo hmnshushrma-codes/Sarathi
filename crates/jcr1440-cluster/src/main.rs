@@ -20,10 +20,12 @@ use tokio::sync::watch;
 mod clusters;
 mod gauges;
 mod gps_logger;
+mod journey;
 mod preflight;
 mod splash;
 mod switcher;
 mod theme;
+mod trip_db;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -112,7 +114,11 @@ impl SmoothedGauges {
         else { 6 }
     }
 
-    fn to_layout(&self, frame: &Option<TelemetryFrame>, connected: bool, error_msg: &Option<String>) -> gauges::ClusterLayout {
+    fn to_layout(
+        &self, frame: &Option<TelemetryFrame>,
+        connected: bool, error_msg: &Option<String>,
+        journey: &journey::JourneyRecorder,
+    ) -> gauges::ClusterLayout {
         gauges::ClusterLayout {
             rpm: self.rpm,
             speed: self.speed,
@@ -131,6 +137,12 @@ impl SmoothedGauges {
             connected,
             error_msg: error_msg.clone(),
             redline_intensity: 0.0,
+            speed_source: journey.speed_source.label(),
+            gps_speed: journey.gps_speed,
+            obd_speed: journey.obd_speed,
+            trip_active: journey.is_trip_active(),
+            trip_distance_km: journey.trip_distance(),
+            trip_points: journey.trip_points(),
         }
     }
 }
@@ -172,8 +184,10 @@ struct NinoDashApp {
     // Data loss recovery
     data_lost_since: Option<Instant>,
     data_restored_at: Option<Instant>,
-    // GPS track logger
+    // GPS track logger (GPX files)
     gps_logger: gps_logger::GpsLogger,
+    // Journey recorder (SQLite trips + auto trip detection)
+    journey: journey::JourneyRecorder,
 }
 
 impl NinoDashApp {
@@ -205,6 +219,7 @@ impl NinoDashApp {
             data_lost_since: None,
             data_restored_at: None,
             gps_logger: gps_logger::GpsLogger::new(),
+            journey: journey::JourneyRecorder::new(),
         }
     }
 
@@ -213,7 +228,9 @@ impl NinoDashApp {
         match state {
             DeviceState::Live(frame) => {
                 self.gauges.update(&frame.obd);
-                // Log GPS track
+                // Journey recorder (SQLite + trip detection + speed source)
+                self.journey.update(&frame.gps, &frame.obd);
+                // GPX track logger (backup)
                 self.gps_logger.log_point(&frame.gps);
                 if !self.connected {
                     self.data_restored_at = Some(Instant::now());
@@ -258,7 +275,7 @@ impl NinoDashApp {
         self.update_telemetry();
 
         let layout = self.gauges.to_layout(
-            &self.last_frame, self.connected, &self.error_msg);
+            &self.last_frame, self.connected, &self.error_msg, &self.journey);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG_BLACK))

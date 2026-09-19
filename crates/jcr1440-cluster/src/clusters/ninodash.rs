@@ -193,21 +193,36 @@ fn draw_rpm_arc(painter: &Painter, rect: Rect, data: &ClusterLayout) {
 // ---------------------------------------------------------------------------
 
 fn draw_center_display(painter: &Painter, center: Pos2, h: f32, data: &ClusterLayout) {
-    // Speed — large
+    // Speed — large (use primary speed from journey recorder)
+    let display_speed = if data.speed > 0.1 { data.speed }
+        else if data.gps_speed > 0.1 { data.gps_speed }
+        else { 0.0 };
     painter.text(
         Pos2::new(center.x, center.y),
         Align2::CENTER_CENTER,
-        &format!("{:.0}", data.speed),
+        &format!("{:.0}", display_speed),
         FontId::proportional(h * 0.16),
         SPEED_COLOR,
     );
+    // Speed unit + source indicator
+    let source_label = format!("km/h  SPD:{}", data.speed_source);
     painter.text(
         Pos2::new(center.x, center.y + h * 0.10),
         Align2::CENTER_CENTER,
-        "km/h",
-        FontId::proportional(h * 0.025),
+        &source_label,
+        FontId::proportional(h * 0.022),
         LABEL_DIM,
     );
+    // GPS speed as secondary (when OBD is primary)
+    if data.speed_source == "OBD" && data.gps_speed > 1.0 {
+        painter.text(
+            Pos2::new(center.x, center.y + h * 0.13),
+            Align2::CENTER_CENTER,
+            &format!("GPS {:.0} km/h", data.gps_speed),
+            FontId::proportional(h * 0.018),
+            Color32::from_rgb(80, 80, 85),
+        );
+    }
 
     // Gear — above speed
     let gear_text = if data.gear == 0 { "P".to_string() } else { format!("{}", data.gear) };
@@ -401,14 +416,24 @@ fn draw_status_bar(painter: &Painter, rect: Rect, data: &ClusterLayout) {
         oil_color,
     );
 
-    // NinoDash brand — right
-    painter.text(
-        Pos2::new(rect.right() - 20.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        "NinoDash",
-        FontId::proportional(h * 0.28),
-        Color32::from_rgb(60, 60, 65),
-    );
+    // Trip info — right area
+    if data.trip_active {
+        painter.text(
+            Pos2::new(rect.right() - 20.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            &format!("TRIP {:.1}km", data.trip_distance_km),
+            FontId::proportional(h * 0.30),
+            theme::ORANGE,
+        );
+    } else {
+        painter.text(
+            Pos2::new(rect.right() - 20.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "NinoDash",
+            FontId::proportional(h * 0.28),
+            Color32::from_rgb(60, 60, 65),
+        );
+    }
 
     // DTC warning if active
     if data.dtc_count > 0 {

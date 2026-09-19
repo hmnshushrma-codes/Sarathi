@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""ninodash-trip-status — Show current and recent trip info from SQLite."""
+import sqlite3
+import os
+import sys
+import time
+
+DB_PATH = "/var/log/ninodash/trips.db"
+
+def main():
+    if not os.path.exists(DB_PATH):
+        print("No trip database found.")
+        print(f"Expected: {DB_PATH}")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    # Latest trip
+    row = conn.execute(
+        "SELECT * FROM trips ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    if not row:
+        print("No trips recorded yet.")
+        return
+
+    active = bool(row["active"])
+    trip_id = row["id"]
+
+    print("NinoDash Trip Status")
+    print("=" * 40)
+    print(f"Trip active: {'YES' if active else 'NO'}")
+    print(f"Trip ID: {trip_id}")
+
+    started = row["started_at"]
+    if started:
+        # Convert epoch to IST
+        t = time.gmtime(started + 5.5 * 3600)
+        print(f"Started: {time.strftime('%H:%M:%S', t)}")
+
+    if row["ended_at"]:
+        t = time.gmtime(row["ended_at"] + 5.5 * 3600)
+        print(f"Ended: {time.strftime('%H:%M:%S', t)}")
+        duration = row["ended_at"] - started
+        mins = int(duration // 60)
+        secs = int(duration % 60)
+        print(f"Duration: {mins}m {secs}s")
+
+    print(f"Points: {row['point_count']}")
+    print(f"Distance: {row['distance_km']:.1f} km")
+    print(f"Max GPS speed: {row['max_gps_speed']:.0f} km/h")
+    print(f"Max OBD speed: {row['max_obd_speed']:.0f} km/h")
+    print(f"Avg speed: {row['avg_speed']:.1f} km/h")
+
+    if row["start_lat"] != 0:
+        print(f"Start: {row['start_lat']:.5f}, {row['start_lng']:.5f}")
+    if row["end_lat"] != 0:
+        print(f"End: {row['end_lat']:.5f}, {row['end_lng']:.5f}")
+
+    # Last point timestamp
+    last_pt = conn.execute(
+        "SELECT timestamp FROM trip_points WHERE trip_id = ? ORDER BY timestamp DESC LIMIT 1",
+        (trip_id,)
+    ).fetchone()
+    if last_pt and active:
+        ago = time.time() - last_pt["timestamp"]
+        print(f"Last point: {ago:.1f} sec ago")
+
+    # GPS fix from latest point
+    if last_pt:
+        pt = conn.execute(
+            "SELECT * FROM trip_points WHERE trip_id = ? ORDER BY timestamp DESC LIMIT 1",
+            (trip_id,)
+        ).fetchone()
+        if pt:
+            print(f"GPS fix: YES ({pt['satellites']} sats)")
+
+    # Total trips
+    total = conn.execute("SELECT COUNT(*) as c FROM trips").fetchone()["c"]
+    print(f"\nTotal trips: {total}")
+
+    conn.close()
+
+if __name__ == "__main__":
+    main()

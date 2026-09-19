@@ -70,8 +70,15 @@ pub struct ClusterLayout {
     pub dtc_count: u32,
     pub connected: bool,
     pub error_msg: Option<String>,
-    /// 0.0 to 1.0 — how far into the redline zone we are (for background effect)
     pub redline_intensity: f32,
+    // Speed source info
+    pub speed_source: &'static str,  // "OBD", "GPS", "---"
+    pub gps_speed: f32,
+    pub obd_speed: f32,
+    // Trip info
+    pub trip_active: bool,
+    pub trip_distance_km: f64,
+    pub trip_points: u32,
 }
 
 pub fn draw_full_cluster(painter: &Painter, rect: Rect, data: &ClusterLayout) {

@@ -76,7 +76,7 @@ mkdir -p /opt/jcr1440-monitor /var/log/jcr1440
 cp "${SCRIPT_DIR}/monitor/monitor.py" /opt/jcr1440-monitor/
 cp "${SCRIPT_DIR}/monitor/create-bundle.sh" /opt/jcr1440-monitor/
 chmod +x /opt/jcr1440-monitor/monitor.py /opt/jcr1440-monitor/create-bundle.sh
-for cmd in jcr1440-status jcr1440-logs jcr1440-tail; do
+for cmd in jcr1440-status jcr1440-logs jcr1440-tail ninodash-trip-status; do
     cp "${SCRIPT_DIR}/monitor/$cmd" "/usr/local/bin/$cmd"
     chmod +x "/usr/local/bin/$cmd"
 done
